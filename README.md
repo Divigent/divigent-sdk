@@ -66,11 +66,17 @@ Common read methods:
 
 Common write methods:
 
+- `planApproveUsdc(amount)`
+- `planDeposit(params)`
+- `planWithdraw(params)`
+- `sendPlan(plan)`
 - `approveUsdc(amount)`
 - `deposit(params)`
 - `depositAndWait(params)`
 - `withdraw(params)`
 - `withdrawAndWait(params)`
+
+Planning methods return viem-ready requests without broadcasting transactions.
 
 Helpers:
 

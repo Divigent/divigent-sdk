@@ -1,5 +1,6 @@
-import type { PublicClient, WalletClient } from 'viem';
+import type { PublicClient, WalletClient, WriteContractParameters } from 'viem';
 import { getAddress, isAddress } from 'viem';
+import { routerAbi, usdcAbi } from './abis';
 import {
   CHAINS,
   assertProtocolDeployed,
@@ -15,8 +16,10 @@ import {
   OperatorAckRequiredError,
   PermitUnsupportedFor7702AccountError,
   runRead,
+  runWrite,
   ZeroAddressError,
 } from './errors';
+import { txHash } from './types';
 import type {
   EvmAddress,
   DepositResult,
@@ -24,6 +27,7 @@ import type {
   OracleStatus,
   PermitSig,
   Position,
+  Prettify,
   TreasuryStatus,
   TxHash,
   VaultAllocation,
@@ -180,6 +184,49 @@ export type DepositWithPermitParams = DepositParams & {
   fallbackOn7702?: boolean;
 };
 
+/** @notice viem write request returned by Divigent transaction planning methods. */
+export type DivigentWriteRequest = WriteContractParameters;
+
+/** @notice Shared shape for transactions planned but not broadcast by the SDK. */
+export type DivigentTransactionPlan<TKind extends string = string> = Prettify<{
+  kind: TKind;
+  request: DivigentWriteRequest;
+}>;
+
+/** @notice Planned USDC approval transaction. */
+export type ApproveUsdcPlan = Prettify<DivigentTransactionPlan<'approveUsdc'> & {
+  owner: EvmAddress;
+  token: EvmAddress;
+  spender: EvmAddress;
+  amount: bigint;
+  simulationResult: boolean;
+}>;
+
+/** @notice Planned Divigent deposit transaction and the values used to build it. */
+export type DepositPlan = Prettify<DivigentTransactionPlan<'deposit'> & {
+  owner: EvmAddress;
+  wallet: EvmAddress;
+  amount: bigint;
+  previewShares: bigint;
+  minSharesOut: bigint;
+  slippageBps: number;
+  allowance: bigint;
+  approvalRequired: bigint;
+  simulated: boolean;
+  simulatedSharesOut?: bigint;
+}>;
+
+/** @notice Planned Divigent withdrawal transaction and the values used to build it. */
+export type WithdrawPlan = Prettify<DivigentTransactionPlan<'withdraw'> & {
+  owner: EvmAddress;
+  wallet: EvmAddress;
+  shares: bigint;
+  previewUsdcOut: bigint;
+  minUsdcOut: bigint;
+  slippageBps: number;
+  simulatedUsdcOut: bigint;
+}>;
+
 /** @notice Parameters for burning dvUSDC shares and receiving USDC. */
 export type WithdrawParams = {
   /** @notice dvUSDC shares to burn. */
@@ -215,6 +262,13 @@ export type SignInitializeForParams = {
 // Stablecoin vault PPS drift is normally tiny; 10 bps is a tight default for
 // user-initiated exits. The x402 recall path uses a wider payment-safe margin.
 const DEFAULT_SLIPPAGE_BPS = 10;
+
+function withFeeOverrides(
+  request: unknown,
+  fees: FeeOverrides | undefined,
+): DivigentWriteRequest {
+  return (fees ? { ...(request as object), ...fees } : request) as DivigentWriteRequest;
+}
 
 /** @notice Main viem-native facade for Divigent reads, writes, signing, and x402 hooks. */
 export class Divigent {
@@ -351,6 +405,27 @@ export class Divigent {
       );
     }
     return this.walletClient;
+  }
+
+  private requireSigner(): {
+    walletClient: WalletClient;
+    account: NonNullable<WalletClient['account']>;
+    chain: NonNullable<WalletClient['chain']>;
+  } {
+    const walletClient = this.requireWallet();
+    if (!walletClient.account) {
+      throw new DivigentError('[@divigent/sdk] walletClient has no account', {
+        code: 'DIVIGENT_WALLET_ACCOUNT_REQUIRED',
+        category: 'wallet',
+      });
+    }
+    if (!walletClient.chain) {
+      throw new DivigentError('[@divigent/sdk] walletClient has no chain', {
+        code: 'DIVIGENT_WALLET_CHAIN_REQUIRED',
+        category: 'wallet',
+      });
+    }
+    return { walletClient, account: walletClient.account, chain: walletClient.chain };
   }
 
   private defaultWallet(): EvmAddress {
@@ -698,6 +773,92 @@ export class Divigent {
   }
 
   /**
+   * @notice Build and simulate an exact USDC approval transaction without broadcasting it.
+   * @param amount USDC amount in atomic units.
+   * @param fees Optional EIP-1559 fee overrides to include in the planned request.
+   * @returns A viem-ready write request and approval metadata.
+   */
+  async planApproveUsdc(amount: bigint, fees?: FeeOverrides): Promise<ApproveUsdcPlan> {
+    const { account, chain } = this.requireSigner();
+    const { request, result } = await runWrite(() => this.publicClient.simulateContract({
+      address: this.addresses.usdc,
+      abi: usdcAbi,
+      functionName: 'approve',
+      args: [this.addresses.router, amount],
+      account,
+      chain,
+    }), usdcAbi);
+
+    return {
+      kind: 'approveUsdc',
+      owner: account.address as EvmAddress,
+      token: this.addresses.usdc,
+      spender: this.addresses.router,
+      amount,
+      request: withFeeOverrides(request, fees),
+      simulationResult: result,
+    };
+  }
+
+  /**
+   * @notice Build a Divigent deposit transaction without broadcasting it.
+   *
+   * @remarks The plan always returns a viem-ready deposit request. If current
+   * allowance is insufficient, `simulated` is false because the deposit would
+   * revert until an approval transaction is mined.
+   * @param params Deposit amount, optional credited wallet, slippage, and fees.
+   * @returns Deposit request, preview values, and approval requirement.
+   */
+  async planDeposit(params: DepositParams): Promise<DepositPlan> {
+    const { account, chain } = this.requireSigner();
+    const owner = account.address as EvmAddress;
+    const wallet = params.wallet ?? owner;
+    const previewShares = await this.previewDeposit(params.amount);
+    const slippageBps = params.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
+    const minSharesOut = params.minSharesOut ?? applySlippageDown(previewShares, slippageBps);
+    const allowance = await this.usdcAllowance(owner);
+    const approvalRequired = allowance >= params.amount ? 0n : params.amount - allowance;
+
+    const baseRequest = {
+      address: this.addresses.router,
+      abi: routerAbi,
+      functionName: 'deposit',
+      args: [params.amount, wallet, minSharesOut],
+      account,
+      chain,
+    } as const;
+
+    let request = withFeeOverrides(baseRequest, params.fees);
+    let simulatedSharesOut: bigint | undefined;
+    let simulated = false;
+
+    if (approvalRequired === 0n) {
+      const simulatedDeposit = await runWrite(
+        () => this.publicClient.simulateContract(baseRequest as never),
+        routerAbi,
+      );
+      request = withFeeOverrides(simulatedDeposit.request, params.fees);
+      simulatedSharesOut = simulatedDeposit.result as bigint;
+      simulated = true;
+    }
+
+    return {
+      kind: 'deposit',
+      owner,
+      wallet,
+      amount: params.amount,
+      previewShares,
+      minSharesOut,
+      slippageBps,
+      allowance,
+      approvalRequired,
+      simulated,
+      request,
+      ...(simulatedSharesOut !== undefined && { simulatedSharesOut }),
+    };
+  }
+
+  /**
    * @notice Deposit USDC after allowance is already in place.
    * @remarks If `minSharesOut` is omitted, the SDK derives it from
    * `previewDeposit` and `slippageBps` to protect callers from adverse
@@ -836,6 +997,52 @@ export class Divigent {
       minUsdcOut,
       ...(params.fees && { fees: params.fees }),
     });
+  }
+
+  /**
+   * @notice Build and simulate a Divigent withdrawal transaction without broadcasting it.
+   * @param params Share amount, optional wallet/minimum output/slippage, and optional fees.
+   * @returns A viem-ready withdraw request and preview/simulation metadata.
+   */
+  async planWithdraw(params: WithdrawParams): Promise<WithdrawPlan> {
+    const { account, chain } = this.requireSigner();
+    const owner = account.address as EvmAddress;
+    const wallet = params.wallet ?? owner;
+    const previewUsdcOut = await this.previewRedeem(params.shares, wallet);
+    const slippageBps = params.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
+    const minUsdcOut = params.minUsdcOut ?? applySlippageDown(previewUsdcOut, slippageBps);
+
+    const { request, result } = await runWrite(() => this.publicClient.simulateContract({
+      address: this.addresses.router,
+      abi: routerAbi,
+      functionName: 'withdraw',
+      args: [params.shares, wallet, minUsdcOut],
+      account,
+      chain,
+    }), routerAbi);
+
+    return {
+      kind: 'withdraw',
+      owner,
+      wallet,
+      shares: params.shares,
+      previewUsdcOut,
+      minUsdcOut,
+      slippageBps,
+      request: withFeeOverrides(request, params.fees),
+      simulatedUsdcOut: result as bigint,
+    };
+  }
+
+  /**
+   * @notice Broadcast a previously planned Divigent transaction.
+   * @param plan Plan returned by `planApproveUsdc`, `planDeposit`, or `planWithdraw`.
+   * @returns Transaction hash.
+   */
+  async sendPlan(plan: DivigentTransactionPlan): Promise<TxHash> {
+    const walletClient = this.requireWallet();
+    const hash = await runWrite(() => walletClient.writeContract(plan.request as never));
+    return txHash(hash);
   }
 
   /**

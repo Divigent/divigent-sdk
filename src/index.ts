@@ -2,12 +2,17 @@
 
 export { Divigent } from './divigent';
 export type {
+  ApproveUsdcPlan,
   DepositParams,
+  DepositPlan,
   DepositWithPermitParams,
   DivigentConfig,
+  DivigentTransactionPlan,
+  DivigentWriteRequest,
   SetOperatorParams,
   SignInitializeForParams,
   SignPermitParams,
+  WithdrawPlan,
   WithdrawParams,
 } from './divigent';
 
