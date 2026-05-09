@@ -98,6 +98,9 @@ export async function handleDivigentSettlement(
   }
 
   if (!settle.success) return undefined;
+  if (typeof settle.transaction !== 'string' || settle.transaction.length === 0) {
+    return undefined;
+  }
   const resource = options.resource ?? (response.url || undefined);
   if (!shouldHandleResourceByPolicy(options.config, resource)) return undefined;
 

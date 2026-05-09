@@ -16,6 +16,13 @@ export const BPS_DENOMINATOR: bigint = 10_000n;
  * @returns USDC amount in atomic units.
  */
 export function parseUsdc(value: string): bigint {
+  if (!/^\d+(?:\.\d{1,6})?$/.test(value)) {
+    throw new DivigentError(`[@divigent/sdk] invalid USDC amount: ${value}`, {
+      code: 'DIVIGENT_INVALID_USDC_AMOUNT',
+      category: 'validation',
+      context: { value },
+    });
+  }
   return parseUnits(value, USDC_DECIMALS);
 }
 

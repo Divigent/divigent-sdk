@@ -1,8 +1,8 @@
-import { baseSepolia } from 'viem/chains';
+import { base, baseSepolia, type Chain } from 'viem/chains';
 import { DivigentError } from '../errors';
 import { type EvmAddress, evmAddress } from '../types';
 
-export type DivigentChain = 'base-sepolia';
+export type DivigentChain = 'base' | 'base-sepolia';
 
 /** @notice Contract addresses needed to operate one Divigent deployment. */
 export type ContractAddresses = {
@@ -20,15 +20,30 @@ export type ContractAddresses = {
 export type ChainConfig = {
   id: number;
   name: DivigentChain;
-  viemChain: typeof baseSepolia;
+  viemChain: Chain;
   addresses: ContractAddresses;
 };
 
 /** @notice Canonical zero address used for not-yet-deployed protocol contracts. */
 export const ZERO_ADDRESS: EvmAddress = evmAddress('0x0000000000000000000000000000000000000000');
 
-/** @notice Built-in chain registry for the Base Sepolia beta deployment. */
+/** @notice Built-in chain registry for supported Base deployments. */
 export const CHAINS = {
+  base: {
+    id: base.id,
+    name: 'base',
+    viemChain: base,
+    addresses: {
+      router:                   ZERO_ADDRESS,
+      oracle:                   ZERO_ADDRESS,
+      feeCollector:             ZERO_ADDRESS,
+      dvUsdc:                   ZERO_ADDRESS,
+      usdc:                     evmAddress('0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'),
+      aavePool:                 evmAddress('0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'),
+      aToken:                   evmAddress('0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB'),
+      steakhouseUSDCPrimeVault: evmAddress('0xbeeF010f9cb27031ad51e3333f9aF9C6B1228183'),
+    },
+  },
   'base-sepolia': {
     id: baseSepolia.id,
     name: 'base-sepolia',
