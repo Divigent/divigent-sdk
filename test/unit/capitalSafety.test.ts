@@ -29,6 +29,7 @@ function pseudoRandom(seed: bigint): () => bigint {
 }
 
 describe('capital safety invariants', () => {
+  // Exercises: never derives a slippage or fee output above the input amount.
   it('never derives a slippage or fee output above the input amount', () => {
     const next = pseudoRandom(7n);
 
@@ -52,6 +53,7 @@ describe('capital safety invariants', () => {
     }
   });
 
+  // Exercises: keeps virtual share conversion round trips conservative under floor rounding.
   it('keeps virtual share conversion round trips conservative under floor rounding', () => {
     const next = pseudoRandom(11n);
 
@@ -71,6 +73,7 @@ describe('capital safety invariants', () => {
     }
   });
 
+  // Exercises: keeps decimal downscaling between floor and ceil bounds.
   it('keeps decimal downscaling between floor and ceil bounds', () => {
     const next = pseudoRandom(19n);
 
@@ -93,6 +96,7 @@ describe('capital safety invariants', () => {
     }
   });
 
+  // Exercises: keeps reserve EMA between previous EMA and the capped payment sample.
   it('keeps reserve EMA between previous EMA and the capped payment sample', () => {
     const next = pseudoRandom(23n);
     const floor = new ReserveFloor({
@@ -117,6 +121,7 @@ describe('capital safety invariants', () => {
     }
   });
 
+  // Exercises: x402 recall asks the contract only for the exact liquidity deficit.
   it('x402 recall asks the contract only for the exact liquidity deficit', async () => {
     const cases = [
       { balance: usdc('0'), payment: usdc('1'), floor: usdc('0.1') },
@@ -154,6 +159,7 @@ describe('capital safety invariants', () => {
     }
   });
 
+  // Exercises: x402 recall never acts on payments above the cap.
   it('x402 recall never acts on payments above the cap', async () => {
     const { client, hooks } = createX402Client();
     const divigent = createX402Divigent({
@@ -175,6 +181,7 @@ describe('capital safety invariants', () => {
     expect(divigent.withdrawAndWait).not.toHaveBeenCalled();
   });
 
+  // Exercises: idle redeposit never deposits the reserve floor or sub-threshold dust.
   it('idle redeposit never deposits the reserve floor or sub-threshold dust', async () => {
     const balances = [
       usdc('0'),

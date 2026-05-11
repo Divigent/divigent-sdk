@@ -11,6 +11,7 @@ import {
   X402_AGENT_FULL_EXIT_PRIVATE_KEY,
   X402_AGENT_WITHDRAW_PRIVATE_KEY,
 } from './helpers/x402AgentFork';
+// Exercises: x402 agent withdraws part of its position for payment liquidity.
 test.sequential(
   'x402 agent withdraws part of its position for payment liquidity',
   async ({ divigent, publicClient, rpcUrl }) => {
@@ -62,6 +63,7 @@ test.sequential(
     });
   },
 );
+// Exercises: x402 agent fully exits Divigent when it wants all liquidity back.
 test.sequential(
   'x402 agent fully exits Divigent when it wants all liquidity back',
   async ({ divigent, publicClient, rpcUrl }) => {

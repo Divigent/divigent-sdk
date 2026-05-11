@@ -69,6 +69,7 @@ function receiptWithLogs(logs: Array<{
 }
 
 describe('receipt parsing', () => {
+  // Exercises: parses Deposited event receipts.
   it('parses Deposited event receipts', () => {
     const topics = encodeEventTopics({
       abi: routerAbi,
@@ -85,6 +86,7 @@ describe('receipt parsing', () => {
       sharesMinted: 990n,
     });
   });
+  // Exercises: parses Withdrawn event receipts.
   it('parses Withdrawn event receipts', () => {
     const topics = encodeEventTopics({
       abi: routerAbi,
@@ -101,6 +103,7 @@ describe('receipt parsing', () => {
       usdcReturned: usdc('0.000490'),
     });
   });
+  // Exercises: ignores unrelated logs and parses the first matching money event.
   it('ignores unrelated logs and parses the first matching money event', () => {
     const withdrawTopics = encodeEventTopics({
       abi: routerAbi,
@@ -129,6 +132,7 @@ describe('receipt parsing', () => {
       sharesMinted: 990n,
     });
   });
+  // Exercises: throws typed receipt errors when expected events are missing.
   it('throws typed receipt errors when expected events are missing', () => {
     const empty = { transactionHash: HASH_1, logs: [] } as unknown as TransactionReceipt;
     expect(() => parseDepositReceipt(empty)).toThrow(ReceiptParseError);
@@ -137,6 +141,7 @@ describe('receipt parsing', () => {
 });
 
 describe('error normalization', () => {
+  // Exercises: decodes every %s custom error selector.
   it.each(errorAbis)('decodes every %s custom error selector', (_label, abi) => {
     const errors = (abi as readonly AbiError[]).filter((item) => item.type === 'error');
     expect(errors.length).toBeGreaterThan(0);
@@ -160,6 +165,7 @@ describe('error normalization', () => {
       expect((decoded as ContractRevertError).args ?? []).toHaveLength(args.length);
     }
   });
+  // Exercises: decodes dvUSDC NonTransferable for raw ABI consumers.
   it('decodes dvUSDC NonTransferable for raw ABI consumers', () => {
     const data = encodeErrorResult({
       abi: dvUsdcAbi,
@@ -171,6 +177,7 @@ describe('error normalization', () => {
       code: 'DIVIGENT_CONTRACT_REVERT',
     });
   });
+  // Exercises: decodes Divigent custom errors from raw revert data.
   it('decodes Divigent custom errors from raw revert data', () => {
     const data = encodeErrorResult({
       abi: routerAbi,
@@ -185,6 +192,7 @@ describe('error normalization', () => {
       category: 'contract',
     });
   });
+  // Exercises: extracts raw revert data from nested viem errors.
   it('extracts raw revert data from nested viem errors', () => {
     const data = encodeErrorResult({
       abi: routerAbi,
@@ -198,6 +206,7 @@ describe('error normalization', () => {
 
     expect(extractRevertData(viemError)).toBe(data);
   });
+  // Exercises: maps Solidity Error(string) reverts to RequireError.
   it('maps Solidity Error(string) reverts to RequireError', () => {
     const abi = parseAbi(['error Error(string)']);
     const data = encodeErrorResult({
@@ -220,6 +229,7 @@ describe('error normalization', () => {
       category: 'contract',
     });
   });
+  // Exercises: maps Solidity Panic reverts and user wallet rejections to typed errors.
   it('maps Solidity Panic reverts and user wallet rejections to typed errors', () => {
     const panicAbi = parseAbi(['error Panic(uint256)']);
     const panicData = encodeErrorResult({
@@ -247,6 +257,7 @@ describe('error normalization', () => {
       category: 'wallet',
     });
   });
+  // Exercises: preserves existing DivigentError metadata and merges new context.
   it('preserves existing DivigentError metadata and merges new context', () => {
     const base = new DivigentError('base', {
       code: 'BASE',
@@ -265,6 +276,7 @@ describe('error normalization', () => {
       context: { a: 1, b: 2 },
     });
   });
+  // Exercises: marks retryable read failures based on network-like messages.
   it('marks retryable read failures based on network-like messages', async () => {
     await expect(
       runRead(async () => {
@@ -276,6 +288,7 @@ describe('error normalization', () => {
       retryable: true,
     });
   });
+  // Exercises: labels write and signing failures by phase so money-movement failures are actionable.
   it('labels write and signing failures by phase so money-movement failures are actionable', async () => {
     await expect(
       runWrite(async () => {

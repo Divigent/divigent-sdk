@@ -10,6 +10,7 @@ import {
   X402_AGENT_INITIALIZE_OWNER_PRIVATE_KEY,
   X402_AGENT_INITIALIZE_RELAYER_PRIVATE_KEY,
 } from './helpers/x402AgentFork';
+// Exercises: x402 agent authorizes itself through a relayed initializeFor signature.
 test.sequential(
   'x402 agent authorizes itself through a relayed initializeFor signature',
   async ({ divigent, publicClient, rpcUrl }) => {

@@ -17,6 +17,7 @@ import {
 } from '../helpers';
 
 describe('depositIdleAboveFloor', () => {
+  // Exercises: returns undefined when no wallet is available.
   it('returns undefined when no wallet is available', async () => {
     const divigent = createIncomeDivigent({ wallet: '' });
     const floor = new ReserveFloor({ minIdleThreshold: usdc('0.000100') });
@@ -25,6 +26,7 @@ describe('depositIdleAboveFloor', () => {
     expect(divigent.depositWithPermit).not.toHaveBeenCalled();
   });
 
+  // Exercises: does nothing when balance is below reserve floor or idle is below minDeposit.
   it('does nothing when balance is below reserve floor or idle is below minDeposit', async () => {
     const below = createIncomeDivigent({ balances: [usdc('0.000100')] });
     await expect(
@@ -41,6 +43,7 @@ describe('depositIdleAboveFloor', () => {
     expect(tooSmall.depositWithPermit).not.toHaveBeenCalled();
   });
 
+  // Exercises: deposits exactly idle balance above reserve floor and records dedupe key.
   it('deposits exactly idle balance above reserve floor and records dedupe key', async () => {
     const divigent = createIncomeDivigent({ balances: [usdc('0.000250')] });
     const seenTxHashes = new Set<string>();
@@ -59,6 +62,7 @@ describe('depositIdleAboveFloor', () => {
     expect(seenTxHashes.has('settlement-1')).toBe(true);
   });
 
+  // Exercises: ignores duplicate settlement keys.
   it('ignores duplicate settlement keys', async () => {
     const divigent = createIncomeDivigent({ balances: [usdc('0.000250')] });
     const seenTxHashes = new Set(['settlement-1']);
@@ -72,6 +76,7 @@ describe('depositIdleAboveFloor', () => {
     expect(divigent.usdcBalance).not.toHaveBeenCalled();
   });
 
+  // Exercises: serializes concurrent sweeps per wallet and rechecks the dedupe key inside the lock.
   it('serializes concurrent sweeps per wallet and rechecks the dedupe key inside the lock', async () => {
     const divigent = createIncomeDivigent({ balances: [usdc('0.000250'), usdc('0.000250')] });
     const floor = new ReserveFloor({ minIdleThreshold: usdc('0.000100') });
@@ -95,6 +100,7 @@ describe('depositIdleAboveFloor', () => {
 });
 
 describe('handleDivigentSettlement', () => {
+  // Exercises: ignores missing, malformed, unsuccessful, or policy-blocked settlements.
   it('ignores missing, malformed, unsuccessful, or policy-blocked settlements', async () => {
     const divigent = createIncomeDivigent({ balances: [usdc('0.000250')] });
     const floor = new ReserveFloor({ minIdleThreshold: usdc('0.000100') });
@@ -131,6 +137,7 @@ describe('handleDivigentSettlement', () => {
     expect(divigent.depositWithPermit).not.toHaveBeenCalled();
   });
 
+  // Exercises: deposits idle funds once for successful settlements.
   it('deposits idle funds once for successful settlements', async () => {
     const divigent = createIncomeDivigent({ balances: [usdc('0.000250')] });
     const floor = new ReserveFloor({ minIdleThreshold: usdc('0.000100') });
@@ -161,6 +168,7 @@ describe('handleDivigentSettlement', () => {
 });
 
 describe('settlement wrappers', () => {
+  // Exercises: evicts old settlement dedupe keys at capacity so new income is not blocked forever.
   it('evicts old settlement dedupe keys at capacity so new income is not blocked forever', async () => {
     const divigent = createIncomeDivigent({
       balances: [usdc('0.000250'), usdc('0.000260'), usdc('0.000270')],
@@ -200,6 +208,7 @@ describe('settlement wrappers', () => {
     });
   });
 
+  // Exercises: derives settlement resources from string, URL, and Request fetch inputs.
   it('derives settlement resources from string, URL, and Request fetch inputs', async () => {
     const inputs: Array<Parameters<typeof fetch>[0]> = [
       'https://api.example.com/paid',
@@ -228,6 +237,7 @@ describe('settlement wrappers', () => {
     }
   });
 
+  // Exercises: wraps fetch without blocking the paid response when redeposit runs in the background.
   it('wraps fetch without blocking the paid response when redeposit runs in the background', async () => {
     const divigent = createIncomeDivigent({ balances: [usdc('0.000250')] });
     const floor = new ReserveFloor({ minIdleThreshold: usdc('0.000100') });
@@ -252,6 +262,7 @@ describe('settlement wrappers', () => {
     expect(onNonFatalError).not.toHaveBeenCalled();
   });
 
+  // Exercises: reports background settlement failures without replacing the paid response.
   it('reports background settlement failures without replacing the paid response', async () => {
     const divigent = createIncomeDivigent({ balances: [usdc('0.000250')], depositRejects: true });
     const floor = new ReserveFloor({ minIdleThreshold: usdc('0.000100') });
@@ -275,6 +286,7 @@ describe('settlement wrappers', () => {
     }));
   });
 
+  // Exercises: attaches seller income redeposit hooks and swallows non-fatal failures.
   it('attaches seller income redeposit hooks and swallows non-fatal failures', async () => {
     const onAfterSettle = vi.fn();
     const server = { onAfterSettle };

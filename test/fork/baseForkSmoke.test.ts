@@ -15,6 +15,7 @@ import { divigentBaseMainnetForkTest as test } from './setup';
 const FRESH_LOCAL_FORK_PRIVATE_KEY =
   '0x1111111111111111111111111111111111111111111111111111111111111111';
 
+// Exercises: verifies the deployed Base mainnet contract wiring on an isolated fork.
 test.sequential(
   'verifies the deployed Base mainnet contract wiring on an isolated fork',
   async ({ divigent, publicClient }) => {
@@ -35,6 +36,7 @@ test.sequential(
   },
 );
 
+// Exercises: plans deposits conservatively for a fresh fork wallet without allowance.
 test.sequential(
   'plans deposits conservatively for a fresh fork wallet without allowance',
   async ({ divigent, publicClient, rpcUrl }) => {
@@ -59,6 +61,7 @@ test.sequential(
   },
 );
 
+// Exercises: broadcasts a real approval transaction against forked Base mainnet USDC.
 test.sequential(
   'broadcasts a real approval transaction against forked Base mainnet USDC',
   async ({ account, divigent, publicClient }) => {

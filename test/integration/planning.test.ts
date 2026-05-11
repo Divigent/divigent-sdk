@@ -9,6 +9,7 @@ import {
   withPreparedAgent,
   X402_AGENT_PLAN_PRIVATE_KEY,
 } from './helpers/x402AgentFork';
+// Exercises: x402 agent executes planned approve, deposit, and withdraw transactions.
 test.sequential(
   'x402 agent executes planned approve, deposit, and withdraw transactions',
   async ({ divigent, publicClient, rpcUrl }) => {

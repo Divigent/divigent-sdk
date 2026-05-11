@@ -9,6 +9,7 @@ import {
   withPreparedAgent,
   X402_AGENT_PERMIT_PRIVATE_KEY,
 } from './helpers/x402AgentFork';
+// Exercises: x402 agent deposits with USDC permit when no approval exists.
 test.sequential(
   'x402 agent deposits with USDC permit when no approval exists',
   async ({ divigent, publicClient, rpcUrl }) => {

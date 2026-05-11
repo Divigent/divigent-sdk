@@ -13,6 +13,7 @@ import {
   X402_AGENT_POLICY_PRIVATE_KEY,
   X402_SELLER,
 } from './helpers/x402AgentFork';
+// Exercises: x402 agent policy refuses unsafe x402 payments without moving funds.
 test.sequential(
   'x402 agent policy refuses unsafe x402 payments without moving funds',
   async ({ divigent, publicClient, rpcUrl }) => {

@@ -117,12 +117,14 @@ describe('EIP-712 hash vectors', () => {
     },
   ] as const;
 
+  // Exercises: pins every permit typed-data vector to its expected EIP-712 hash.
   it.each(vectors)('pins $name hash', (vector) => {
     expect(hashTypedData(vector as never)).toBe(vector.hash);
   });
 });
 
 describe('USDC permit signing', () => {
+  // Exercises: rejects contract-code owners so callers can fall back from EOA permit flow.
   it('rejects contract-code owners so callers can fall back from EOA permit flow', async () => {
     const { publicClient, walletClient } = createMockClients({ getCode: '0x1234' });
 
@@ -137,6 +139,7 @@ describe('USDC permit signing', () => {
       }),
     ).rejects.toBeInstanceOf(PermitUnsupportedFor7702AccountError);
   });
+  // Exercises: normalizes high-s signatures and flips v before returning permit parts.
   it('normalizes high-s signatures and flips v before returning permit parts', async () => {
     const { publicClient, walletClient } = createMockClients({
       signTypedData: () => highSSignature(27),
@@ -156,6 +159,7 @@ describe('USDC permit signing', () => {
     expect(permit.v).toBe(28);
     expect(permit.deadline).toBe(2_000n);
   });
+  // Exercises: accepts compact v values and leaves low-s signatures unchanged.
   it('accepts compact v values and leaves low-s signatures unchanged', async () => {
     const first = createMockClients({
       signTypedData: () => signatureWithParts(1n, 2n, 0),
@@ -190,6 +194,7 @@ describe('USDC permit signing', () => {
       v: 28,
     });
   });
+  // Exercises: signs the exact Circle USDC EIP-2612 domain and money fields.
   it('signs the exact Circle USDC EIP-2612 domain and money fields', async () => {
     const { publicClient, walletClient, signTypedData } = createMockClients({
       signTypedData: () => lowSSignature(),
@@ -222,6 +227,7 @@ describe('USDC permit signing', () => {
       },
     }));
   });
+  // Exercises: uses an explicit permit owner instead of silently signing for the wallet account.
   it('uses an explicit permit owner instead of silently signing for the wallet account', async () => {
     const { publicClient, walletClient, signTypedData } = createMockClients({
       signTypedData: () => lowSSignature(),
@@ -245,6 +251,7 @@ describe('USDC permit signing', () => {
       }),
     }));
   });
+  // Exercises: rejects unexpected v values.
   it('rejects unexpected v values', async () => {
     const { publicClient, walletClient } = createMockClients({
       signTypedData: () => signatureWithParts(1n, 2n, 29),
@@ -261,6 +268,7 @@ describe('USDC permit signing', () => {
       }),
     ).rejects.toMatchObject({ code: 'DIVIGENT_INVALID_SIGNATURE_V' });
   });
+  // Exercises: requires wallet account and chain before attempting permit reads.
   it('requires wallet account and chain before attempting permit reads', async () => {
     const noAccount = createMockClients({ includeWalletAccount: false });
     await expect(
@@ -291,6 +299,7 @@ describe('USDC permit signing', () => {
 });
 
 describe('initializeFor signing', () => {
+  // Exercises: rejects router EIP-712 chain-id mismatches before signing.
   it('rejects router EIP-712 chain-id mismatches before signing', async () => {
     const { divigent, signTypedData } = createDivigentWithClients({
       readContract: (request) => {
@@ -311,6 +320,7 @@ describe('initializeFor signing', () => {
     });
     expect(signTypedData).not.toHaveBeenCalled();
   });
+  // Exercises: rejects router EIP-712 verifying-contract mismatches before signing.
   it('rejects router EIP-712 verifying-contract mismatches before signing', async () => {
     const { divigent, signTypedData } = createDivigentWithClients({
       readContract: (request) => {
@@ -334,6 +344,7 @@ describe('initializeFor signing', () => {
 });
 
 describe('depositWithPermit behavior', () => {
+  // Exercises: uses chain time + 3600 seconds for the default permit deadline.
   it('uses chain time + 3600 seconds for the default permit deadline', async () => {
     const { divigent, signTypedData } = createDivigentWithClients({
       blockTimestamp: 123_456n,
@@ -349,6 +360,7 @@ describe('depositWithPermit behavior', () => {
     };
     expect(signed.message.deadline).toBe(127_056n);
   });
+  // Exercises: falls back to approve, wait, then deposit for 7702/smart-account owners.
   it('falls back to approve, wait, then deposit for 7702/smart-account owners', async () => {
     const { divigent, simulateContract, writeContract, waitForTransactionReceipt } =
       createDivigentWithClients({
@@ -366,6 +378,7 @@ describe('depositWithPermit behavior', () => {
     expect(waitForTransactionReceipt).toHaveBeenCalledWith({ hash: HASH_1 });
     expect(writeContract).toHaveBeenCalledTimes(2);
   });
+  // Exercises: does not fall back when fallbackOn7702 is false.
   it('does not fall back when fallbackOn7702 is false', async () => {
     const { divigent, writeContract } = createDivigentWithClients({ getCode: '0x1234' });
 
@@ -374,6 +387,7 @@ describe('depositWithPermit behavior', () => {
     ).rejects.toBeInstanceOf(PermitUnsupportedFor7702AccountError);
     expect(writeContract).not.toHaveBeenCalled();
   });
+  // Exercises: surfaces PermitExpired from router permit-deposit simulation.
   it('surfaces PermitExpired from router permit-deposit simulation', async () => {
     const data = encodeErrorResult({
       abi: routerAbi,
@@ -401,6 +415,7 @@ describe('depositWithPermit behavior', () => {
       code: 'DIVIGENT_CONTRACT_REVERT',
     });
   });
+  // Exercises: surfaces replayed permit allowance failures from router simulation.
   it('surfaces replayed permit allowance failures from router simulation', async () => {
     const amount = usdc('0.001');
     const data = encodeErrorResult({
@@ -431,6 +446,7 @@ describe('depositWithPermit behavior', () => {
       code: 'DIVIGENT_CONTRACT_REVERT',
     });
   });
+  // Exercises: serializes permit signing per owner to avoid nonce collisions.
   it('serializes permit signing per owner to avoid nonce collisions', async () => {
     let inFlight = 0;
     let maxInFlight = 0;
@@ -452,6 +468,7 @@ describe('depositWithPermit behavior', () => {
     expect(signTypedData).toHaveBeenCalledTimes(2);
     expect(maxInFlight).toBe(1);
   });
+  // Exercises: keeps the permit queue usable after a failed permit attempt.
   it('keeps the permit queue usable after a failed permit attempt', async () => {
     const signTypedData = vi
       .fn()

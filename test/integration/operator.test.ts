@@ -17,6 +17,7 @@ import {
   X402_AGENT_OWNER_PRIVATE_KEY,
   X402_PAYMENT_OPERATOR_PRIVATE_KEY,
 } from './helpers/x402AgentFork';
+// Exercises: x402 agent owner can explicitly delegate and revoke a payment operator.
 test.sequential(
   'x402 agent owner can explicitly delegate and revoke a payment operator',
   async ({ divigent, publicClient, rpcUrl }) => {

@@ -7,6 +7,7 @@ import { X402_AGENT_READ_PRIVATE_KEY } from './helpers/x402AgentFork';
 
 const ROUTABLE_VENUES = ['AAVE', 'MORPHO'] as const;
 
+// Exercises: x402 agent reads protocol and account state before liquidity actions.
 test.sequential(
   'x402 agent reads protocol and account state before liquidity actions',
   async ({ divigent }) => {

@@ -11,6 +11,7 @@ import {
   X402_AGENT_RECALL_PRIVATE_KEY,
   X402_SELLER,
 } from './helpers/x402AgentFork';
+// Exercises: x402 agent recall hook withdraws enough liquidity before an allowed x402 payment.
 test.sequential(
   'x402 agent recall hook withdraws enough liquidity before an allowed x402 payment',
   async ({ divigent, publicClient, rpcUrl }) => {

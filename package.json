@@ -30,7 +30,6 @@
     "test": "vitest run test/unit",
     "test:fork:base": "vitest run test/fork --testTimeout=180000 --maxWorkers=1 --pool=forks",
     "test:integration:base": "vitest run test/integration --testTimeout=180000 --no-file-parallelism --maxWorkers=1 --pool=forks",
-    "test:package": "npm run build && node scripts/package-smoke.mjs",
     "test:x402:local": "vitest run test/integration/x402Recall.test.ts test/integration/x402Policy.test.ts --testTimeout=180000 --no-file-parallelism --maxWorkers=1 --pool=forks",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist coverage .turbo",

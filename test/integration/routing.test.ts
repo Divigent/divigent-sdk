@@ -275,6 +275,7 @@ function expectRoute(
   }
   return facts.route;
 }
+// Exercises: x402 agent deposits into the real Base venue selected by TWAR and fully exits it.
 test.sequential(
   'x402 agent deposits into the real Base venue selected by TWAR and fully exits it',
   async ({ divigent, publicClient, rpcUrl }) => {
@@ -337,6 +338,7 @@ test.sequential(
     });
   },
 );
+// Exercises: x402 agent deposits into real Base Morpho when Aave capacity is unavailable.
 test.sequential(
   'x402 agent deposits into real Base Morpho when Aave capacity is unavailable',
   async ({ divigent, publicClient, rpcUrl }) => {
@@ -410,6 +412,7 @@ test.sequential(
     });
   },
 );
+// Exercises: x402 agent withdraw emits ExitRedirected when Aave liquidity is constrained.
 test.sequential(
   'x402 agent withdraw emits ExitRedirected when Aave liquidity is constrained',
   async ({ divigent, publicClient, rpcUrl }) => {

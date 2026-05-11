@@ -9,6 +9,7 @@ import {
   withPreparedAgent,
   X402_AGENT_GUARD_PRIVATE_KEY,
 } from './helpers/x402AgentFork';
+// Exercises: x402 agent receives clear guardrails for unsafe deposit and withdraw attempts.
 test.sequential(
   'x402 agent receives clear guardrails for unsafe deposit and withdraw attempts',
   async ({ divigent, publicClient, rpcUrl }) => {

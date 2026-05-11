@@ -63,6 +63,7 @@ async function withEmergencyDivigent<T>(params: {
     await rpcRequest(params.rpcUrl, 'anvil_stopImpersonatingAccount', [emergencyMultisig]);
   }
 }
+// Exercises: SDK pause keeps deposits blocked while permissionless withdraw remains available.
 test.sequential(
   'SDK pause keeps deposits blocked while permissionless withdraw remains available',
   async ({ divigent, publicClient, rpcUrl }) => {
@@ -110,6 +111,7 @@ test.sequential(
     });
   },
 );
+// Exercises: SDK treasury rotation can be proposed, cancelled, proposed again, and executed.
 test.sequential(
   'SDK treasury rotation can be proposed, cancelled, proposed again, and executed',
   async ({ divigent, publicClient, rpcUrl }) => {
@@ -175,6 +177,7 @@ test.sequential(
     });
   },
 );
+// Exercises: SDK recordObservation refreshes a stale oracle before deposits resume.
 test.sequential(
   'SDK recordObservation refreshes a stale oracle before deposits resume',
   async ({ divigent, publicClient, rpcUrl }) => {

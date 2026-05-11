@@ -8,6 +8,7 @@ import {
   withPreparedAgent,
   X402_AGENT_DEPOSIT_PRIVATE_KEY,
 } from './helpers/x402AgentFork';
+// Exercises: x402 agent deposits idle USDC through approve plus deposit.
 test.sequential(
   'x402 agent deposits idle USDC through approve plus deposit',
   async ({ divigent, publicClient, rpcUrl }) => {
