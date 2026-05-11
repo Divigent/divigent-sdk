@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { baseSepolia } from 'viem/chains';
-import type { Divigent } from '../../src/divigent';
 import { AlreadyAttachedError, PaymentCapExceededError } from '../../src/errors';
 import { attachDivigentYield } from '../../src/x402/attach';
 import { ReserveFloor } from '../../src/x402/attach';
@@ -10,51 +9,21 @@ import {
   SELLER,
   addresses,
   createX402Client,
+  createX402Divigent,
   usdc,
   x402PaymentContext,
 } from './helpers';
-
-function createX402Divigent(opts: {
-  balances?: readonly bigint[] | undefined;
-  previewWithdrawNet?: bigint | undefined;
-  withdrawRejects?: boolean | undefined;
-  depositRejects?: boolean | undefined;
-} = {}) {
-  const balances = [...(opts.balances ?? [0n])];
-  return {
-    chain: 'base-sepolia',
-    addresses,
-    walletClient: { account: { address: OWNER } },
-    usdcBalance: vi.fn(async () => balances.shift() ?? balances.at(-1) ?? 0n),
-    previewWithdrawNet: vi.fn(async () => opts.previewWithdrawNet ?? 1n),
-    withdrawAndWait: vi.fn(async () => {
-      if (opts.withdrawRejects) throw new Error('withdraw failed');
-      return { txHash: HASH_1, usdcReturned: opts.previewWithdrawNet ?? 1n };
-    }),
-    depositWithPermit: vi.fn(async () => {
-      if (opts.depositRejects) throw new Error('deposit failed');
-      return HASH_1;
-    }),
-  } as unknown as Divigent & {
-    usdcBalance: ReturnType<typeof vi.fn>;
-    previewWithdrawNet: ReturnType<typeof vi.fn>;
-    withdrawAndWait: ReturnType<typeof vi.fn>;
-    depositWithPermit: ReturnType<typeof vi.fn>;
-  };
-}
 
 afterEach(() => {
   vi.useRealTimers();
 });
 
 describe('ReserveFloor', () => {
-  // Uses the configured minimum floor until EMA reserve exceeds it.
   it('uses the configured minimum floor until EMA reserve exceeds it', () => {
     const floor = new ReserveFloor();
     expect(floor.required()).toBe(usdc('1000'));
   });
 
-  // Updates EMA and clamps payment samples by payment cap.
   it('updates EMA and clamps payment samples by payment cap', () => {
     const floor = new ReserveFloor({
       minIdleThreshold: 0n,
@@ -76,7 +45,6 @@ describe('ReserveFloor', () => {
     expect(clamped.required()).toBe(usdc('0.006'));
   });
 
-  // Handles reserve boundary configuration without inventing extra liquidity.
   it('handles reserve boundary configuration without inventing extra liquidity', () => {
     const zeroRatio = new ReserveFloor({
       minIdleThreshold: usdc('0.000123'),
@@ -104,7 +72,6 @@ describe('ReserveFloor', () => {
     expect(fractional.required()).toBe(usdc('0.134'));
   });
 
-  // Ignores zero and negative payment samples.
   it('ignores zero and negative payment samples', () => {
     const floor = new ReserveFloor({ minIdleThreshold: 0n });
     floor.recordPayment(0n);
@@ -115,34 +82,28 @@ describe('ReserveFloor', () => {
 });
 
 describe('x402 recall hook policy and liquidity behavior', () => {
-  // Ignores non-Divigent x402 contexts.
-  it('ignores non-Divigent x402 contexts', async () => {
+  it.each([
+    [
+      'unsupported x402 version',
+      { paymentRequired: { x402Version: 1, resource: { url: 'https://api.example.com/paid' } } },
+    ],
+    ['wrong network', { network: `eip155:${baseSepolia.id + 1}`, asset: addresses.usdc }],
+    [
+      'wrong asset',
+      { network: `eip155:${baseSepolia.id}`, asset: '0x9999999999999999999999999999999999999999' },
+    ],
+    ['wrong scheme', { network: `eip155:${baseSepolia.id}`, asset: addresses.usdc, scheme: 'permit2' }],
+  ] as const)('ignores non-Divigent x402 context: %s', async (_label, context) => {
     const { client, hooks } = createX402Client();
     const divigent = createX402Divigent({ balances: [0n] });
     attachDivigentYield(client as never, divigent);
 
-    await hooks.before?.(x402PaymentContext({
-      paymentRequired: { x402Version: 1, resource: { url: 'https://api.example.com/paid' } },
-    }));
-    await hooks.before?.(x402PaymentContext({
-      network: `eip155:${baseSepolia.id + 1}`,
-      asset: addresses.usdc,
-    }));
-    await hooks.before?.(x402PaymentContext({
-      network: `eip155:${baseSepolia.id}`,
-      asset: '0x9999999999999999999999999999999999999999',
-    }));
-    await hooks.before?.(x402PaymentContext({
-      network: `eip155:${baseSepolia.id}`,
-      asset: addresses.usdc,
-      scheme: 'permit2',
-    }));
+    await hooks.before?.(x402PaymentContext(context));
 
     expect(divigent.usdcBalance).not.toHaveBeenCalled();
     expect(divigent.withdrawAndWait).not.toHaveBeenCalled();
   });
 
-  // Prevents duplicate attachment until detached.
   it('prevents duplicate attachment until detached', () => {
     const { client } = createX402Client();
     const divigent = createX402Divigent();
@@ -153,7 +114,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(() => attachDivigentYield(client as never, divigent)).not.toThrow();
   });
 
-  // Enforces payment caps before recall.
   it('enforces payment caps before recall', async () => {
     const { client, hooks } = createX402Client();
     const divigent = createX402Divigent();
@@ -165,7 +125,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(divigent.usdcBalance).not.toHaveBeenCalled();
   });
 
-  // Uses the tighter resource-specific payment cap before checking balances.
   it('uses the tighter resource-specific payment cap before checking balances', async () => {
     const { client, hooks } = createX402Client();
     const divigent = createX402Divigent({ balances: [usdc('0.001')] });
@@ -185,8 +144,18 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(divigent.usdcBalance).not.toHaveBeenCalled();
   });
 
-  // Supports array resource caps and falls back to the global cap on pattern miss.
-  it('supports array resource caps and falls back to the global cap on pattern miss', async () => {
+  it.each([
+    [
+      'matching resource cap',
+      'https://api.example.com/premium/1',
+      true,
+    ],
+    [
+      'global cap on pattern miss',
+      'https://api.example.com/basic/1',
+      false,
+    ],
+  ] as const)('applies array resource cap policy: %s', async (_label, resource, shouldReject) => {
     const { client, hooks } = createX402Client();
     const divigent = createX402Divigent({ balances: [usdc('0.001')] });
     attachDivigentYield(client as never, divigent, {
@@ -197,25 +166,23 @@ describe('x402 recall hook policy and liquidity behavior', () => {
       minIdleThreshold: 0n,
     });
 
-    await expect(
-      hooks.before?.(x402PaymentContext({
-        amount: usdc('0.000251'),
-        resource: 'https://api.example.com/premium/1',
-      })),
-    ).rejects.toBeInstanceOf(PaymentCapExceededError);
-
-    await expect(
-      hooks.before?.(x402PaymentContext({
-        amount: usdc('0.000251'),
-        resource: 'https://api.example.com/basic/1',
-      })),
-    ).resolves.toBeUndefined();
-
-    expect(divigent.usdcBalance).toHaveBeenCalledTimes(1);
+    const payment = hooks.before?.(x402PaymentContext({
+      amount: usdc('0.000251'),
+      resource,
+    }));
+    if (shouldReject) {
+      await expect(payment).rejects.toBeInstanceOf(PaymentCapExceededError);
+      expect(divigent.usdcBalance).not.toHaveBeenCalled();
+    } else {
+      await expect(payment).resolves.toBeUndefined();
+      expect(divigent.usdcBalance).toHaveBeenCalledTimes(1);
+    }
   });
 
-  // Supports regex and array resource policies before touching wallet funds.
-  it('supports regex and array resource policies before touching wallet funds', async () => {
+  it.each([
+    ['blocked resource', 'https://api.example.com/admin/1', false],
+    ['regex-allowed resource', 'https://api.example.com/paid/42', true],
+  ] as const)('applies array resource allow policy: %s', async (_label, resource, shouldHandle) => {
     const { client, hooks } = createX402Client();
     const divigent = createX402Divigent({ balances: [usdc('0.01')] });
     attachDivigentYield(client as never, divigent, {
@@ -226,18 +193,16 @@ describe('x402 recall hook policy and liquidity behavior', () => {
       minIdleThreshold: 0n,
     });
 
-    await hooks.before?.(x402PaymentContext({
-      resource: 'https://api.example.com/admin/1',
-    }));
-    await hooks.before?.(x402PaymentContext({
-      resource: 'https://api.example.com/paid/42',
-    }));
+    await hooks.before?.(x402PaymentContext({ resource }));
 
-    expect(divigent.usdcBalance).toHaveBeenCalledTimes(1);
+    expect(divigent.usdcBalance).toHaveBeenCalledTimes(shouldHandle ? 1 : 0);
   });
 
-  // Blocks missing policy fields before touching wallet funds.
-  it('blocks missing policy fields before touching wallet funds', async () => {
+  it.each([
+    ['missing payTo', { payTo: '' }],
+    ['missing resource', { payTo: SELLER, resource: '' }],
+    ['malformed resource', { payTo: SELLER, resource: 'not-a-url' }],
+  ] as const)('blocks %s before touching wallet funds', async (_label, context) => {
     const { client, hooks } = createX402Client();
     const divigent = createX402Divigent({ balances: [usdc('0.01')] });
     attachDivigentYield(client as never, divigent, {
@@ -247,15 +212,16 @@ describe('x402 recall hook policy and liquidity behavior', () => {
       minIdleThreshold: 0n,
     });
 
-    await hooks.before?.(x402PaymentContext({ payTo: '' }));
-    await hooks.before?.(x402PaymentContext({ payTo: SELLER, resource: '' }));
-    await hooks.before?.(x402PaymentContext({ payTo: SELLER, resource: 'not-a-url' }));
+    await hooks.before?.(x402PaymentContext(context));
 
     expect(divigent.usdcBalance).not.toHaveBeenCalled();
   });
 
-  // Applies payTo, resource, origin, and custom policy filters.
-  it('applies payTo, resource, origin, and custom policy filters', async () => {
+  it.each([
+    ['payTo allowlist', { payTo: '0x5555555555555555555555555555555555555555' }, false],
+    ['resource origin allowlist', { payTo: SELLER, resource: 'https://evil.example.com/paid' }, false],
+    ['allowed payment', { payTo: SELLER, resource: 'https://api.example.com/paid' }, true],
+  ] as const)('applies %s policy filter', async (_label, context, shouldHandle) => {
     const { client, hooks } = createX402Client();
     const divigent = createX402Divigent({ balances: [usdc('0.01')] });
     const shouldHandlePayment = vi.fn(() => true);
@@ -267,46 +233,36 @@ describe('x402 recall hook policy and liquidity behavior', () => {
       minIdleThreshold: 0n,
     });
 
-    await hooks.before?.(x402PaymentContext({
-      payTo: '0x5555555555555555555555555555555555555555',
-    }));
-    await hooks.before?.(x402PaymentContext({
-      payTo: SELLER,
-      resource: 'https://evil.example.com/paid',
-    }));
-    await hooks.before?.(x402PaymentContext({
-      payTo: SELLER,
-      resource: 'https://api.example.com/paid',
-    }));
+    await hooks.before?.(x402PaymentContext(context));
 
-    expect(shouldHandlePayment).toHaveBeenCalledTimes(1);
-    expect(divigent.usdcBalance).toHaveBeenCalledTimes(1);
+    expect(shouldHandlePayment).toHaveBeenCalledTimes(shouldHandle ? 1 : 0);
+    expect(divigent.usdcBalance).toHaveBeenCalledTimes(shouldHandle ? 1 : 0);
   });
 
-  // Honors custom policy false returns and propagates policy callback failures.
-  it('honors custom policy false returns and propagates policy callback failures', async () => {
-    const blocked = createX402Client();
-    const blockedDivigent = createX402Divigent({ balances: [usdc('0.01')] });
-    attachDivigentYield(blocked.client as never, blockedDivigent, {
+  it('honors custom policy false returns', async () => {
+    const { client, hooks } = createX402Client();
+    const divigent = createX402Divigent({ balances: [usdc('0.01')] });
+    attachDivigentYield(client as never, divigent, {
       shouldHandlePayment: () => false,
     });
 
-    await blocked.hooks.before?.(x402PaymentContext());
-    expect(blockedDivigent.usdcBalance).not.toHaveBeenCalled();
+    await hooks.before?.(x402PaymentContext());
+    expect(divigent.usdcBalance).not.toHaveBeenCalled();
+  });
 
-    const failing = createX402Client();
-    const failingDivigent = createX402Divigent({ balances: [usdc('0.01')] });
-    attachDivigentYield(failing.client as never, failingDivigent, {
+  it('propagates custom policy callback failures', async () => {
+    const { client, hooks } = createX402Client();
+    const divigent = createX402Divigent({ balances: [usdc('0.01')] });
+    attachDivigentYield(client as never, divigent, {
       shouldHandlePayment: () => {
         throw new Error('policy unavailable');
       },
     });
 
-    await expect(failing.hooks.before?.(x402PaymentContext())).rejects.toThrow('policy unavailable');
-    expect(failingDivigent.usdcBalance).not.toHaveBeenCalled();
+    await expect(hooks.before?.(x402PaymentContext())).rejects.toThrow('policy unavailable');
+    expect(divigent.usdcBalance).not.toHaveBeenCalled();
   });
 
-  // Does not withdraw when wallet balance covers payment plus reserve.
   it('does not withdraw when wallet balance covers payment plus reserve', async () => {
     const { client, hooks } = createX402Client();
     const onBeforePayment = vi.fn();
@@ -328,7 +284,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     }));
   });
 
-  // Recalls only the deficit needed for payment plus reserve.
   it('recalls only the deficit needed for payment plus reserve', async () => {
     const { client, hooks } = createX402Client();
     const onBeforePayment = vi.fn();
@@ -360,7 +315,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     }));
   });
 
-  // Handles exact-balance and one-atomic-unit deficit boundaries.
   it('handles exact-balance and one-atomic-unit deficit boundaries', async () => {
     const exact = createX402Client();
     const exactDivigent = createX402Divigent({ balances: [usdc('1.5')] });
@@ -389,7 +343,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     }));
   });
 
-  // Does not withdraw when the contract preview says a deficit rounds to zero shares.
   it('does not withdraw when the contract preview says a deficit rounds to zero shares', async () => {
     const { client, hooks } = createX402Client();
     const onBeforePayment = vi.fn();
@@ -412,7 +365,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(onBeforePayment.mock.calls[0]?.[0]).not.toHaveProperty('recallShares');
   });
 
-  // Does not treat a mined recall as safe until wallet balance reaches the required floor.
   it('does not treat a mined recall as safe until wallet balance reaches the required floor', async () => {
     vi.useFakeTimers();
     const { client, hooks } = createX402Client();
@@ -444,7 +396,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     }));
   });
 
-  // Ignores after/failure hooks that were not preceded by a handled payment.
   it('ignores after/failure hooks that were not preceded by a handled payment', async () => {
     const { client, hooks } = createX402Client();
     const onAfterPaymentCreation = vi.fn();
@@ -464,7 +415,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(onPaymentFailure).not.toHaveBeenCalled();
   });
 
-  // Does not run hooks after detach.
   it('does not run hooks after detach', async () => {
     const { client, hooks } = createX402Client();
     const divigent = createX402Divigent({ balances: [usdc('1')] });
@@ -481,31 +431,19 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(divigent.depositWithPermit).not.toHaveBeenCalled();
   });
 
-  // Serializes concurrent recall checks per attached client.
   it('serializes concurrent recall checks per attached client', async () => {
     const { client, hooks } = createX402Client();
     let inFlight = 0;
     let maxInFlight = 0;
-    const divigent = {
-      chain: 'base-sepolia',
-      addresses,
-      walletClient: { account: { address: OWNER } },
-      usdcBalance: vi.fn(async () => {
+    const divigent = createX402Divigent({
+      usdcBalance: async () => {
         inFlight++;
         maxInFlight = Math.max(maxInFlight, inFlight);
         await new Promise((resolve) => setTimeout(resolve, 5));
         inFlight--;
         return usdc('2');
-      }),
-      previewWithdrawNet: vi.fn(),
-      withdrawAndWait: vi.fn(),
-      depositWithPermit: vi.fn(),
-    } as unknown as Divigent & {
-      usdcBalance: ReturnType<typeof vi.fn>;
-      previewWithdrawNet: ReturnType<typeof vi.fn>;
-      withdrawAndWait: ReturnType<typeof vi.fn>;
-      depositWithPermit: ReturnType<typeof vi.fn>;
-    };
+      },
+    });
     attachDivigentYield(client as never, divigent, { minIdleThreshold: 0n });
 
     await Promise.all([
@@ -518,7 +456,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(divigent.withdrawAndWait).not.toHaveBeenCalled();
   });
 
-  // Records successful payments into the reserve EMA after x402 creates payment payload.
   it('records successful payments into the reserve EMA after x402 creates payment payload', async () => {
     const { client, hooks } = createX402Client();
     const onAfterPaymentCreation = vi.fn();
@@ -542,7 +479,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     }));
   });
 
-  // Redeposits recalled USDC when x402 payment creation fails after recall.
   it('redeposits recalled USDC when x402 payment creation fails after recall', async () => {
     const { client, hooks } = createX402Client();
     const onPaymentFailure = vi.fn();
@@ -571,7 +507,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     }));
   });
 
-  // Keeps recalled USDC liquid when redeposit after payment failure reverts.
   it('keeps recalled USDC liquid when redeposit after payment failure reverts', async () => {
     const { client, hooks } = createX402Client();
     const onPaymentFailure = vi.fn();
@@ -601,7 +536,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(onPaymentFailure.mock.calls[0]?.[0]).not.toHaveProperty('redepositTxHash');
   });
 
-  // Does not redeposit on payment failure when no excess USDC remains.
   it('does not redeposit on payment failure when no excess USDC remains', async () => {
     const { client, hooks } = createX402Client();
     const onPaymentFailure = vi.fn();
@@ -625,7 +559,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(onPaymentFailure.mock.calls[0]?.[0]).not.toHaveProperty('redepositAmount');
   });
 
-  // Keeps observer failures non-fatal and normalized through onNonFatalError.
   it('keeps observer failures non-fatal and normalized through onNonFatalError', async () => {
     const { client, hooks } = createX402Client();
     const onNonFatalError = vi.fn();
@@ -652,7 +585,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     }));
   });
 
-  // Surfaces recall failures as observer context without blocking x402 payment creation.
   it('surfaces recall failures as observer context without blocking x402 payment creation', async () => {
     const { client, hooks } = createX402Client();
     const onBeforePayment = vi.fn();
@@ -674,7 +606,6 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     }));
   });
 
-  // Redacts wallet and tx hash in observer callbacks when requested.
   it('redacts wallet and tx hash in observer callbacks when requested', async () => {
     const { client, hooks } = createX402Client();
     const onBeforePayment = vi.fn();

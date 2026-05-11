@@ -1,5 +1,6 @@
 import type { Hex, PublicClient, WalletClient } from 'viem';
 import { routerAbi } from '../abis';
+import { vaultTypeFromId } from '../core/vaultTypes';
 import { DivigentError, runRead, runSign, runWrite } from '../errors';
 import {
   type EvmAddress,
@@ -9,6 +10,7 @@ import {
   type TxHash,
   type VaultAllocation,
   type VaultCapacity,
+  type VaultType,
   txHash,
 } from '../types';
 
@@ -60,6 +62,20 @@ export async function readRouterCurrentAllocation(
     functionName: 'getCurrentAllocation',
   }), routerAbi);
   return { aaveAssets, morphoAssets };
+}
+
+export async function readRouterRecommendedRoute(
+  client: PublicClient,
+  router: EvmAddress,
+  amount: bigint,
+): Promise<VaultType> {
+  const routeId = await runRead(() => client.readContract({
+    address: router,
+    abi: routerAbi,
+    functionName: 'getRecommendedRoute',
+    args: [amount],
+  }), routerAbi);
+  return vaultTypeFromId(routeId);
 }
 
 export function readRouterPricePerShare(

@@ -58,6 +58,9 @@ Common read methods:
 - `getPosition(wallet)`
 - `withdrawCapacity()`
 - `getCurrentAllocation()`
+- `getRecommendedRoute(amount)`
+- `getOptimalVault()`
+- `getAllRates()`
 - `pricePerShare()`
 - `previewDeposit(amount)`
 - `previewRedeem(shares, wallet)`

@@ -44,6 +44,7 @@ export type MockClientOptions = {
   previewDeposit?: bigint | undefined;
   previewRedeem?: bigint | undefined;
   previewWithdrawNet?: bigint | undefined;
+  recommendedRoute?: 0 | 1 | undefined;
   allowance?: bigint | undefined;
   usdcBalance?: bigint | undefined;
   dvUsdcBalance?: bigint | undefined;
@@ -81,6 +82,7 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
     if (functionName === 'previewDeposit') return opts.previewDeposit ?? 1_000_000n;
     if (functionName === 'previewRedeem') return opts.previewRedeem ?? usdc('2');
     if (functionName === 'previewWithdrawNet') return opts.previewWithdrawNet ?? 500_000n;
+    if (functionName === 'getRecommendedRoute') return opts.recommendedRoute ?? 0;
     if (functionName === 'allowance') return opts.allowance ?? 0n;
     if (functionName === 'balanceOf') {
       const reqAddress = String(request.address).toLowerCase();
@@ -233,6 +235,74 @@ export function createX402Client() {
   };
 
   return { client, hooks };
+}
+
+export type MockX402Divigent = Divigent & {
+  usdcBalance: ReturnType<typeof vi.fn>;
+  previewWithdrawNet: ReturnType<typeof vi.fn>;
+  withdrawAndWait: ReturnType<typeof vi.fn>;
+  depositWithPermit: ReturnType<typeof vi.fn>;
+};
+
+export type MockX402DivigentOptions = {
+  wallet?: EvmAddress | '' | undefined;
+  balances?: readonly bigint[] | undefined;
+  previewWithdrawNet?:
+    | bigint
+    | ((deficit: bigint, wallet?: EvmAddress) => bigint | Promise<bigint>)
+    | undefined;
+  withdrawRejects?: boolean | undefined;
+  depositRejects?: boolean | undefined;
+  usdcBalance?: (() => bigint | Promise<bigint>) | undefined;
+};
+
+export function createX402Divigent(opts: MockX402DivigentOptions = {}): MockX402Divigent {
+  const balances = [...(opts.balances ?? [0n])];
+  const walletAddress = opts.wallet === '' ? undefined : opts.wallet ?? OWNER;
+
+  return {
+    chain: 'base-sepolia',
+    addresses,
+    walletClient: walletAddress === undefined
+      ? undefined
+      : { account: { address: walletAddress } },
+    usdcBalance: vi.fn(async () => {
+      if (opts.usdcBalance) return opts.usdcBalance();
+      return balances.shift() ?? balances.at(-1) ?? 0n;
+    }),
+    previewWithdrawNet: vi.fn(async (deficit: bigint, wallet?: EvmAddress) => {
+      if (typeof opts.previewWithdrawNet === 'function') {
+        return opts.previewWithdrawNet(deficit, wallet);
+      }
+      return opts.previewWithdrawNet ?? 1n;
+    }),
+    withdrawAndWait: vi.fn(async ({ shares }: { shares: bigint }) => {
+      if (opts.withdrawRejects) throw new Error('withdraw failed');
+      return { txHash: HASH_1, usdcReturned: shares };
+    }),
+    depositWithPermit: vi.fn(async ({ amount }: { amount: bigint }) => {
+      if (opts.depositRejects) throw new Error('deposit failed');
+      if (amount <= 0n) throw new Error('invalid deposit');
+      return HASH_1;
+    }),
+  } as unknown as MockX402Divigent;
+}
+
+export function settlementHttp(settle: unknown, throws = false) {
+  return {
+    getPaymentSettleResponse: vi.fn(() => {
+      if (throws) throw new Error('missing payment response');
+      return settle;
+    }),
+  };
+}
+
+export function settledResponse(url = 'https://api.example.com/paid'): Response {
+  const response = new Response('{}', { headers: { 'content-type': 'application/json' } }) as Response & {
+    url: string;
+  };
+  Object.defineProperty(response, 'url', { value: url });
+  return response;
 }
 
 export function x402PaymentContext(opts: {

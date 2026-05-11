@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { TransactionReceipt } from 'viem';
+import type { Hex, TransactionReceipt } from 'viem';
 import {
   ContractFunctionRevertedError,
   UserRejectedRequestError,
@@ -8,7 +8,7 @@ import {
   encodeEventTopics,
   parseAbi,
 } from 'viem';
-import { routerAbi } from '../../src/abis';
+import { dvUsdcAbi, feeCollectorAbi, oracleAbi, routerAbi } from '../../src/abis';
 import { parseDepositReceipt, parseWithdrawReceipt } from '../../src/core/receipts';
 import {
   ContractRevertError,
@@ -18,12 +18,35 @@ import {
   RequireError,
   UserRejectedError,
   decodeDivigentError,
+  extractRevertData,
   runRead,
   runSign,
   runWrite,
   toDivigentError,
 } from '../../src/errors';
 import { HASH_1, OWNER, usdc } from './helpers';
+
+type AbiError = {
+  type: 'error';
+  name: string;
+  inputs?: readonly { type: string }[];
+};
+
+const errorAbis = [
+  ['router', routerAbi],
+  ['feeCollector', feeCollectorAbi],
+  ['oracle', oracleAbi],
+  ['dvUsdc', dvUsdcAbi],
+] as const;
+
+function sampleArg(type: string): unknown {
+  if (type === 'address') return OWNER;
+  if (type === 'bytes32') return `0x${'11'.repeat(32)}` as Hex;
+  if (type === 'string') return 'sample revert reason';
+  if (type === 'uint8') return 7;
+  if (type.startsWith('uint')) return 123n;
+  throw new Error(`Unhandled ABI error input type ${type}`);
+}
 
 function receiptWithLog(log: {
   topics: readonly `0x${string}`[];
@@ -46,7 +69,6 @@ function receiptWithLogs(logs: Array<{
 }
 
 describe('receipt parsing', () => {
-  // Parses Deposited event receipts.
   it('parses Deposited event receipts', () => {
     const topics = encodeEventTopics({
       abi: routerAbi,
@@ -63,8 +85,6 @@ describe('receipt parsing', () => {
       sharesMinted: 990n,
     });
   });
-
-  // Parses Withdrawn event receipts.
   it('parses Withdrawn event receipts', () => {
     const topics = encodeEventTopics({
       abi: routerAbi,
@@ -81,8 +101,6 @@ describe('receipt parsing', () => {
       usdcReturned: usdc('0.000490'),
     });
   });
-
-  // Ignores unrelated logs and parses the first matching money event.
   it('ignores unrelated logs and parses the first matching money event', () => {
     const withdrawTopics = encodeEventTopics({
       abi: routerAbi,
@@ -111,8 +129,6 @@ describe('receipt parsing', () => {
       sharesMinted: 990n,
     });
   });
-
-  // Throws typed receipt errors when expected events are missing.
   it('throws typed receipt errors when expected events are missing', () => {
     const empty = { transactionHash: HASH_1, logs: [] } as unknown as TransactionReceipt;
     expect(() => parseDepositReceipt(empty)).toThrow(ReceiptParseError);
@@ -121,7 +137,40 @@ describe('receipt parsing', () => {
 });
 
 describe('error normalization', () => {
-  // Decodes Divigent custom errors from raw revert data.
+  it.each(errorAbis)('decodes every %s custom error selector', (_label, abi) => {
+    const errors = (abi as readonly AbiError[]).filter((item) => item.type === 'error');
+    expect(errors.length).toBeGreaterThan(0);
+
+    for (const error of errors) {
+      const args = (error.inputs ?? []).map((input) => sampleArg(input.type));
+      const data = encodeErrorResult({
+        abi,
+        errorName: error.name,
+        args,
+      } as never);
+
+      const decoded = decodeDivigentError(data);
+
+      expect(decoded).toBeInstanceOf(ContractRevertError);
+      expect(decoded).toMatchObject({
+        errorName: error.name,
+        code: 'DIVIGENT_CONTRACT_REVERT',
+        category: 'contract',
+      });
+      expect((decoded as ContractRevertError).args ?? []).toHaveLength(args.length);
+    }
+  });
+  it('decodes dvUSDC NonTransferable for raw ABI consumers', () => {
+    const data = encodeErrorResult({
+      abi: dvUsdcAbi,
+      errorName: 'NonTransferable',
+    });
+
+    expect(decodeDivigentError(data)).toMatchObject({
+      errorName: 'NonTransferable',
+      code: 'DIVIGENT_CONTRACT_REVERT',
+    });
+  });
   it('decodes Divigent custom errors from raw revert data', () => {
     const data = encodeErrorResult({
       abi: routerAbi,
@@ -136,8 +185,19 @@ describe('error normalization', () => {
       category: 'contract',
     });
   });
+  it('extracts raw revert data from nested viem errors', () => {
+    const data = encodeErrorResult({
+      abi: routerAbi,
+      errorName: 'InvalidAmount',
+    });
+    const viemError = new ContractFunctionRevertedError({
+      abi: routerAbi,
+      data,
+      functionName: 'deposit',
+    });
 
-  // Maps Solidity Error(string) reverts to RequireError.
+    expect(extractRevertData(viemError)).toBe(data);
+  });
   it('maps Solidity Error(string) reverts to RequireError', () => {
     const abi = parseAbi(['error Error(string)']);
     const data = encodeErrorResult({
@@ -160,8 +220,6 @@ describe('error normalization', () => {
       category: 'contract',
     });
   });
-
-  // Maps Solidity Panic reverts and user wallet rejections to typed errors.
   it('maps Solidity Panic reverts and user wallet rejections to typed errors', () => {
     const panicAbi = parseAbi(['error Panic(uint256)']);
     const panicData = encodeErrorResult({
@@ -189,8 +247,6 @@ describe('error normalization', () => {
       category: 'wallet',
     });
   });
-
-  // Preserves existing DivigentError metadata and merges new context.
   it('preserves existing DivigentError metadata and merges new context', () => {
     const base = new DivigentError('base', {
       code: 'BASE',
@@ -209,8 +265,6 @@ describe('error normalization', () => {
       context: { a: 1, b: 2 },
     });
   });
-
-  // Marks retryable read failures based on network-like messages.
   it('marks retryable read failures based on network-like messages', async () => {
     await expect(
       runRead(async () => {
@@ -222,8 +276,6 @@ describe('error normalization', () => {
       retryable: true,
     });
   });
-
-  // Labels write and signing failures by phase so money-movement failures are actionable.
   it('labels write and signing failures by phase so money-movement failures are actionable', async () => {
     await expect(
       runWrite(async () => {

@@ -4,3 +4,4 @@ dist
 /scripts/*
 !/scripts/
 !/scripts/package-smoke.mjs
+.claude

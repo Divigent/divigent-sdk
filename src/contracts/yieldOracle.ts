@@ -1,5 +1,6 @@
 import type { PublicClient, WalletClient } from 'viem';
 import { oracleAbi } from '../abis';
+import { vaultTypeFromId, vaultTypeToId } from '../core/vaultTypes';
 import { DivigentError, runRead, runWrite } from '../errors';
 import {
   type EvmAddress,
@@ -10,20 +11,6 @@ import {
   type VaultType,
   txHash,
 } from '../types';
-
-function vaultTypeFromId(id: number): VaultType {
-  if (id === 0) return 'AAVE';
-  if (id === 1) return 'MORPHO';
-  throw new DivigentError(`[@divigent/sdk] unknown VaultType id: ${id}`, {
-    code: 'DIVIGENT_UNKNOWN_VAULT_TYPE',
-    category: 'validation',
-    context: { id },
-  });
-}
-
-function vaultTypeToId(vt: VaultType): 0 | 1 {
-  return vt === 'AAVE' ? 0 : 1;
-}
 
 // Reads
 

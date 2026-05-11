@@ -1,5 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
-import type { Divigent } from '../../src/divigent';
+import { describe, expect, it } from 'vitest';
 import {
   applyBps,
   applyFee,
@@ -11,7 +10,14 @@ import {
 import { ReserveFloor } from '../../src/x402/attach';
 import { attachDivigentYield } from '../../src/x402/attach';
 import { depositIdleAboveFloor } from '../../src/x402/settlement';
-import { HASH_1, OWNER, addresses, createX402Client, usdc, x402PaymentContext } from '../helpers';
+import {
+  HASH_1,
+  OWNER,
+  createX402Client,
+  createX402Divigent,
+  usdc,
+  x402PaymentContext,
+} from '../helpers';
 
 function pseudoRandom(seed: bigint): () => bigint {
   let state = seed;
@@ -22,42 +28,7 @@ function pseudoRandom(seed: bigint): () => bigint {
   };
 }
 
-function createRecallDivigent(opts: {
-  initialBalance: bigint;
-  balanceAfterRecall: bigint;
-  sharesForDeficit: (deficit: bigint) => bigint;
-}) {
-  const balances = [opts.initialBalance, opts.balanceAfterRecall];
-  return {
-    chain: 'base-sepolia',
-    addresses,
-    walletClient: { account: { address: OWNER } },
-    usdcBalance: vi.fn(async () => balances.shift() ?? opts.balanceAfterRecall),
-    previewWithdrawNet: vi.fn(async (deficit: bigint) => opts.sharesForDeficit(deficit)),
-    withdrawAndWait: vi.fn(async ({ shares }: { shares: bigint }) => ({
-      txHash: HASH_1,
-      usdcReturned: shares,
-    })),
-  } as unknown as Divigent & {
-    usdcBalance: ReturnType<typeof vi.fn>;
-    previewWithdrawNet: ReturnType<typeof vi.fn>;
-    withdrawAndWait: ReturnType<typeof vi.fn>;
-  };
-}
-
-function createIdleDivigent(balance: bigint) {
-  return {
-    walletClient: { account: { address: OWNER } },
-    usdcBalance: vi.fn(async () => balance),
-    depositWithPermit: vi.fn(async () => HASH_1),
-  } as unknown as Divigent & {
-    usdcBalance: ReturnType<typeof vi.fn>;
-    depositWithPermit: ReturnType<typeof vi.fn>;
-  };
-}
-
 describe('capital safety invariants', () => {
-  // Never derives a slippage or fee output above the input amount.
   it('never derives a slippage or fee output above the input amount', () => {
     const next = pseudoRandom(7n);
 
@@ -81,7 +52,6 @@ describe('capital safety invariants', () => {
     }
   });
 
-  // Keeps virtual share conversion round trips conservative under floor rounding.
   it('keeps virtual share conversion round trips conservative under floor rounding', () => {
     const next = pseudoRandom(11n);
 
@@ -101,7 +71,6 @@ describe('capital safety invariants', () => {
     }
   });
 
-  // Keeps decimal downscaling between floor and ceil bounds.
   it('keeps decimal downscaling between floor and ceil bounds', () => {
     const next = pseudoRandom(19n);
 
@@ -124,7 +93,6 @@ describe('capital safety invariants', () => {
     }
   });
 
-  // Keeps reserve EMA between previous EMA and the capped payment sample.
   it('keeps reserve EMA between previous EMA and the capped payment sample', () => {
     const next = pseudoRandom(23n);
     const floor = new ReserveFloor({
@@ -149,7 +117,6 @@ describe('capital safety invariants', () => {
     }
   });
 
-  // x402 recall asks the contract only for the exact liquidity deficit.
   it('x402 recall asks the contract only for the exact liquidity deficit', async () => {
     const cases = [
       { balance: usdc('0'), payment: usdc('1'), floor: usdc('0.1') },
@@ -163,10 +130,9 @@ describe('capital safety invariants', () => {
       const needed = item.payment + item.floor;
       const deficit = item.balance >= needed ? 0n : needed - item.balance;
       const { client, hooks } = createX402Client();
-      const divigent = createRecallDivigent({
-        initialBalance: item.balance,
-        balanceAfterRecall: needed,
-        sharesForDeficit: (d) => d + 1n,
+      const divigent = createX402Divigent({
+        balances: [item.balance, needed],
+        previewWithdrawNet: (deficit) => deficit + 1n,
       });
       attachDivigentYield(client as never, divigent, {
         minIdleThreshold: item.floor,
@@ -188,13 +154,11 @@ describe('capital safety invariants', () => {
     }
   });
 
-  // x402 recall never acts on payments above the cap.
   it('x402 recall never acts on payments above the cap', async () => {
     const { client, hooks } = createX402Client();
-    const divigent = createRecallDivigent({
-      initialBalance: 0n,
-      balanceAfterRecall: 0n,
-      sharesForDeficit: (d) => d,
+    const divigent = createX402Divigent({
+      balances: [0n],
+      previewWithdrawNet: (deficit) => deficit,
     });
     attachDivigentYield(client as never, divigent, {
       maxPaymentAmount: usdc('0.000099'),
@@ -211,7 +175,6 @@ describe('capital safety invariants', () => {
     expect(divigent.withdrawAndWait).not.toHaveBeenCalled();
   });
 
-  // Idle redeposit never deposits the reserve floor or sub-threshold dust.
   it('idle redeposit never deposits the reserve floor or sub-threshold dust', async () => {
     const balances = [
       usdc('0'),
@@ -225,7 +188,7 @@ describe('capital safety invariants', () => {
     ];
 
     for (const balance of balances) {
-      const divigent = createIdleDivigent(balance);
+      const divigent = createX402Divigent({ balances: [balance] });
       const txHash = await depositIdleAboveFloor(
         divigent,
         new ReserveFloor({ minIdleThreshold: usdc('0.000100') }),

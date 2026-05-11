@@ -95,6 +95,7 @@ import {
   readRouterPreviewRedeem,
   readRouterPreviewWithdrawNet,
   readRouterPricePerShare,
+  readRouterRecommendedRoute,
   readRouterTotalVaultAssets,
   readRouterUsdc,
   readRouterWithdrawCapacity,
@@ -470,11 +471,20 @@ export class Divigent {
   }
 
   /**
-   * @notice Read the current Aave/Morpho asset allocation.
+   * @notice Read the current venue asset allocation.
    * @returns Current allocation by venue.
    */
   getCurrentAllocation(): Promise<VaultAllocation> {
     return readRouterCurrentAllocation(this.publicClient, this.addresses.router);
+  }
+
+  /**
+   * @notice Read the router-selected deposit venue for an amount.
+   * @param amount Deposit amount in USDC atomic units.
+   * @returns Venue selected by current oracle rates and route capacity.
+   */
+  getRecommendedRoute(amount: bigint): Promise<VaultType> {
+    return readRouterRecommendedRoute(this.publicClient, this.addresses.router, amount);
   }
 
   /**

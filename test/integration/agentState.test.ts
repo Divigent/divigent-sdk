@@ -5,7 +5,8 @@ import type { EvmAddress } from '../../src/types';
 import { divigentBaseMainnetForkTest as test } from '../fork/setup';
 import { X402_AGENT_READ_PRIVATE_KEY } from './helpers/x402AgentFork';
 
-// Verifies the agent can read deployed protocol state before moving funds.
+const ROUTABLE_VENUES = ['AAVE', 'MORPHO'] as const;
+
 test.sequential(
   'x402 agent reads protocol and account state before liquidity actions',
   async ({ divigent }) => {
@@ -25,10 +26,10 @@ test.sequential(
       previewShares,
       convertedShares,
       depositsPaused,
+      recommendedRoute,
       optimalVault,
       allRates,
-      aaveSafe,
-      morphoSafe,
+      venueSafety,
       oracleFresh,
       oracleStatus,
       observationAge,
@@ -50,10 +51,10 @@ test.sequential(
       divigent.previewDeposit(amount),
       divigent.convertToShares(amount),
       divigent.depositsPaused(),
+      divigent.getRecommendedRoute(amount),
       divigent.getOptimalVault(),
       divigent.getAllRates(),
-      divigent.isVaultSafe('AAVE'),
-      divigent.isVaultSafe('MORPHO'),
+      Promise.all(ROUTABLE_VENUES.map((venue) => divigent.isVaultSafe(venue))),
       divigent.isFresh(),
       divigent.oracleStatus(),
       divigent.lastGoodObservationAge(),
@@ -77,18 +78,24 @@ test.sequential(
     expect(authorized).toBe(false);
     expect(nonce).toBeGreaterThanOrEqual(0n);
     expect(withdrawCapacity.totalWithdrawCap).toBeGreaterThanOrEqual(0n);
-    expect(allocation.aaveAssets + allocation.morphoAssets).toBeGreaterThanOrEqual(0n);
+    const allocatedAssets = Object.values(allocation).reduce(
+      (total, assets) => total + assets,
+      0n,
+    );
+    expect(allocatedAssets).toBeGreaterThanOrEqual(0n);
     expect(pricePerShare).toBeGreaterThan(0n);
     expect(totalVaultAssets).toBeGreaterThanOrEqual(0n);
     expect(tvlCap).toBeGreaterThan(0n);
     expect(previewShares).toBeGreaterThan(0n);
     expect(convertedShares).toBe(previewShares);
     expect(typeof depositsPaused).toBe('boolean');
-    expect(['AAVE', 'MORPHO']).toContain(optimalVault.vaultType);
+    expect(ROUTABLE_VENUES).toContain(recommendedRoute);
+    expect(ROUTABLE_VENUES).toContain(optimalVault.vaultType);
     expect(optimalVault.twarRate).toBeGreaterThanOrEqual(0n);
     expect(allRates.length).toBeGreaterThanOrEqual(2);
-    expect(typeof aaveSafe).toBe('boolean');
-    expect(typeof morphoSafe).toBe('boolean');
+    for (const safe of venueSafety) {
+      expect(typeof safe).toBe('boolean');
+    }
     expect(typeof oracleFresh).toBe('boolean');
     expect(typeof oracleStatus.fresh).toBe('boolean');
     expect(oracleStatus.lastObservationTime).toBeGreaterThanOrEqual(0n);

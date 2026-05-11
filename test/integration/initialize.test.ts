@@ -1,19 +1,19 @@
 import { expect } from 'vitest';
-import { divigentBaseMainnetForkTest as test } from '../fork/setup';
+import {
+  divigentBaseMainnetForkTest as test,
+  withForkSnapshot,
+} from '../fork/setup';
 import {
   createX402AgentForPrivateKey,
-  rpcRequest,
-  withSnapshot,
+  fundWalletEth,
+  sendAndExpectSuccess,
   X402_AGENT_INITIALIZE_OWNER_PRIVATE_KEY,
   X402_AGENT_INITIALIZE_RELAYER_PRIVATE_KEY,
-  X402_TEST_ETH_BALANCE,
 } from './helpers/x402AgentFork';
-
-// Verifies an agent owner can authorize via a relayed EIP-712 initialize signature.
 test.sequential(
   'x402 agent authorizes itself through a relayed initializeFor signature',
   async ({ divigent, publicClient, rpcUrl }) => {
-    await withSnapshot(rpcUrl, async () => {
+    await withForkSnapshot(rpcUrl, async () => {
       const ownerAgent = createX402AgentForPrivateKey({
         privateKey: X402_AGENT_INITIALIZE_OWNER_PRIVATE_KEY,
         rpcUrl,
@@ -26,7 +26,7 @@ test.sequential(
         publicClient,
         addresses: divigent.addresses,
       });
-      await rpcRequest(rpcUrl, 'anvil_setBalance', [relayerAgent.wallet, X402_TEST_ETH_BALANCE]);
+      await fundWalletEth(rpcUrl, relayerAgent.wallet);
 
       const nonceBefore = await ownerAgent.sdk.nonce(ownerAgent.wallet);
       const { timestamp } = await publicClient.getBlock();
@@ -40,9 +40,8 @@ test.sequential(
         deadline,
         sig,
       });
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
-      expect(receipt.status).toBe('success');
+      await sendAndExpectSuccess(publicClient, hash);
       await expect(ownerAgent.sdk.isAuthorized(ownerAgent.wallet)).resolves.toBe(true);
       await expect(ownerAgent.sdk.nonce(ownerAgent.wallet)).resolves.toBe(nonceBefore + 1n);
     });

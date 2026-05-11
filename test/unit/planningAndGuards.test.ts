@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { ContractFunctionRevertedError, encodeErrorResult } from 'viem';
 import { base, baseSepolia } from 'viem/chains';
+import { routerAbi } from '../../src/abis';
 import { Divigent } from '../../src/divigent';
 import {
   AddressMismatchError,
   ChainMismatchError,
+  ContractRevertError,
   DivigentError,
   OperatorAckRequiredError,
   ZeroAddressError,
@@ -22,7 +25,6 @@ import {
 } from './helpers';
 
 describe('Divigent config and wallet guards', () => {
-  // Rejects public or wallet clients bound to a different chain.
   it('rejects public or wallet clients bound to a different chain', () => {
     expect(() => {
       const { publicClient, walletClient } = createMockClients({ publicChainId: 1 });
@@ -34,8 +36,6 @@ describe('Divigent config and wallet guards', () => {
       Divigent.create({ publicClient, walletClient, chain: 'base-sepolia', addresses });
     }).toThrow(ChainMismatchError);
   });
-
-  // Requires a wallet account and chain for planning and writes.
   it('requires a wallet account and chain for planning and writes', async () => {
     const noAccount = createDivigentWithClients({ includeWalletAccount: false });
     await expect(noAccount.divigent.planApproveUsdc(1n)).rejects.toMatchObject({
@@ -53,8 +53,28 @@ describe('Divigent config and wallet guards', () => {
       code: 'DIVIGENT_WALLET_CHAIN_REQUIRED',
     });
   });
+  it('allows read-only clients without a wallet but rejects writes and signing', async () => {
+    const { publicClient, readContract } = createMockClients({ previewDeposit: 123n });
+    const divigent = Divigent.create({
+      publicClient,
+      chain: 'base-sepolia',
+      addresses,
+    });
 
-  // Requires explicit deployment addresses for Base mainnet until canonical addresses exist.
+    await expect(divigent.previewDeposit(usdc('0.001'))).resolves.toBe(123n);
+    expect(readContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'previewDeposit',
+    }));
+    await expect(Promise.resolve().then(() => divigent.approveUsdc(1n)))
+      .rejects.toMatchObject({ code: 'DIVIGENT_WALLET_CLIENT_REQUIRED' });
+    await expect(divigent.deposit({ amount: usdc('0.001'), minSharesOut: 1n }))
+      .rejects.toMatchObject({ code: 'DIVIGENT_WALLET_CLIENT_REQUIRED' });
+    await expect(Promise.resolve().then(() => divigent.signInitializeFor({
+      wallet: OWNER,
+      deadline: 2_000n,
+    })))
+      .rejects.toMatchObject({ code: 'DIVIGENT_WALLET_CLIENT_REQUIRED' });
+  });
   it('requires explicit deployment addresses for Base mainnet until canonical addresses exist', () => {
     const { publicClient, walletClient } = createMockClients({
       publicChainId: base.id,
@@ -67,8 +87,6 @@ describe('Divigent config and wallet guards', () => {
       chain: 'base',
     })).toThrow(DivigentError);
   });
-
-  // Validates custom address overrides before any on-chain call.
   it('validates custom address overrides before any on-chain call', () => {
     const { publicClient, walletClient } = createMockClients();
 
@@ -89,13 +107,10 @@ describe('Divigent config and wallet guards', () => {
 });
 
 describe('configured deployment self-checks', () => {
-  // Accepts matching router, dvUSDC, and fee collector self-identifying reads.
   it('accepts matching router, dvUSDC, and fee collector self-identifying reads', async () => {
     const { divigent } = createDivigentWithClients();
     await expect(divigent.verifyAddresses()).resolves.toBeUndefined();
   });
-
-  // Rejects address registries that disagree with on-chain self-identifying reads.
   it('rejects address registries that disagree with on-chain self-identifying reads', async () => {
     const { divigent } = createDivigentWithClients({
       readContract: (request) => {
@@ -112,8 +127,23 @@ describe('configured deployment self-checks', () => {
   });
 });
 
+describe('router read facades', () => {
+  it('exposes getRecommendedRoute without raw ABI reads', async () => {
+    const amount = usdc('0.001');
+    const { divigent, readContract } = createDivigentWithClients({
+      recommendedRoute: 1,
+    });
+
+    await expect(divigent.getRecommendedRoute(amount)).resolves.toBe('MORPHO');
+    expect(readContract).toHaveBeenCalledWith(expect.objectContaining({
+      address: addresses.router,
+      functionName: 'getRecommendedRoute',
+      args: [amount],
+    }));
+  });
+});
+
 describe('operator acknowledgement guard', () => {
-  // Blocks granting operator authority without explicit acknowledgement.
   it('blocks granting operator authority without explicit acknowledgement', async () => {
     const { divigent, simulateContract } = createDivigentWithClients();
     await expect(
@@ -121,8 +151,6 @@ describe('operator acknowledgement guard', () => {
     ).rejects.toBeInstanceOf(OperatorAckRequiredError);
     expect(simulateContract).not.toHaveBeenCalled();
   });
-
-  // Allows revoking without acknowledgement and granting with acknowledgement.
   it('allows revoking without acknowledgement and granting with acknowledgement', async () => {
     const { divigent, simulateContract, writeContract } = createDivigentWithClients();
 
@@ -144,7 +172,6 @@ describe('operator acknowledgement guard', () => {
 });
 
 describe('deposit and withdraw min-output derivation', () => {
-  // Uses explicit minSharesOut without previewing deposit.
   it('uses explicit minSharesOut without previewing deposit', async () => {
     const { divigent, readContract, simulateContract } = createDivigentWithClients();
 
@@ -158,8 +185,6 @@ describe('deposit and withdraw min-output derivation', () => {
       args: [usdc('0.001'), OWNER, 777n],
     }));
   });
-
-  // Derives minSharesOut from previewDeposit using default and custom slippage.
   it('derives minSharesOut from previewDeposit using default and custom slippage', async () => {
     const first = createDivigentWithClients({ previewDeposit: 1_000_000n });
     await first.divigent.deposit({ amount: usdc('0.001') });
@@ -175,8 +200,23 @@ describe('deposit and withdraw min-output derivation', () => {
       args: [usdc('0.001'), OWNER, applySlippageDown(1_000_000n, 50)],
     }));
   });
+  it('builds operator-driven deposits for the credited wallet while the signer pays USDC', async () => {
+    const { divigent, simulateContract } = createDivigentWithClients({
+      previewDeposit: 1_000_000n,
+    });
 
-  // Uses explicit minUsdcOut without previewing redeem.
+    await divigent.deposit({
+      amount: usdc('0.001'),
+      wallet: SECOND_OWNER,
+      slippageBps: 25,
+    });
+
+    expect(simulateContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'deposit',
+      account: { address: OWNER, type: 'json-rpc' },
+      args: [usdc('0.001'), SECOND_OWNER, applySlippageDown(1_000_000n, 25)],
+    }));
+  });
   it('uses explicit minUsdcOut without previewing redeem', async () => {
     const { divigent, readContract, simulateContract } = createDivigentWithClients();
 
@@ -190,8 +230,6 @@ describe('deposit and withdraw min-output derivation', () => {
       args: [1_000n, OWNER, usdc('0.000888')],
     }));
   });
-
-  // Derives minUsdcOut from previewRedeem using default and custom slippage.
   it('derives minUsdcOut from previewRedeem using default and custom slippage', async () => {
     const first = createDivigentWithClients({ previewRedeem: usdc('2') });
     await first.divigent.withdraw({ shares: 1_000n });
@@ -207,8 +245,6 @@ describe('deposit and withdraw min-output derivation', () => {
       args: [1_000n, OWNER, applySlippageDown(usdc('2'), 75)],
     }));
   });
-
-  // Rejects invalid slippage before broadcasting.
   it('rejects invalid slippage before broadcasting', async () => {
     const { divigent, writeContract } = createDivigentWithClients();
 
@@ -218,10 +254,64 @@ describe('deposit and withdraw min-output derivation', () => {
       .rejects.toBeInstanceOf(DivigentError);
     expect(writeContract).not.toHaveBeenCalled();
   });
+  it.each([
+    ['NoPositionToWithdraw', []],
+    ['PositionRoundsToZero', []],
+    ['PreviewMathDegenerate', []],
+    ['UnserviceableNet', [usdc('10'), usdc('5')]],
+  ] as const)('decodes previewWithdrawNet %s reverts', async (errorName, args) => {
+    const data = encodeErrorResult({
+      abi: routerAbi,
+      errorName,
+      args,
+    } as never);
+    const { divigent } = createDivigentWithClients({
+      readContract: (request) => {
+        if (request.functionName === 'previewWithdrawNet') {
+          throw new ContractFunctionRevertedError({
+            abi: routerAbi,
+            data,
+            functionName: 'previewWithdrawNet',
+          });
+        }
+        throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+      },
+    });
+
+    await expect(divigent.previewWithdrawNet(usdc('10'), OWNER))
+      .rejects.toMatchObject({
+        errorName,
+        code: 'DIVIGENT_CONTRACT_REVERT',
+      });
+    await expect(divigent.previewWithdrawNet(usdc('10'), OWNER))
+      .rejects.toBeInstanceOf(ContractRevertError);
+  });
+  it('decodes replayed initialize attempts as WalletAlreadyAuthorised', async () => {
+    const data = encodeErrorResult({
+      abi: routerAbi,
+      errorName: 'WalletAlreadyAuthorised',
+    });
+    const { divigent } = createDivigentWithClients({
+      simulateContract: (request) => {
+        if (request.functionName === 'initialize') {
+          throw new ContractFunctionRevertedError({
+            abi: routerAbi,
+            data,
+            functionName: 'initialize',
+          });
+        }
+        throw new Error(`Unhandled simulateContract function ${String(request.functionName)}`);
+      },
+    });
+
+    await expect(divigent.initialize()).rejects.toMatchObject({
+      errorName: 'WalletAlreadyAuthorised',
+      code: 'DIVIGENT_CONTRACT_REVERT',
+    });
+  });
 });
 
 describe('transaction planning', () => {
-  // Plans an approval with owner, token, spender, simulation result, and fee overrides.
   it('plans an approval with owner, token, spender, simulation result, and fee overrides', async () => {
     const { divigent } = createDivigentWithClients();
 
@@ -248,8 +338,6 @@ describe('transaction planning', () => {
       maxPriorityFeePerGas: 2n,
     });
   });
-
-  // Broadcasts a planned transaction request without rebuilding it.
   it('broadcasts a planned transaction request without rebuilding it', async () => {
     const { divigent, writeContract } = createDivigentWithClients({
       writeHashes: [HASH_2],
@@ -261,8 +349,6 @@ describe('transaction planning', () => {
     await expect(divigent.sendPlan(plan)).resolves.toBe(HASH_2);
     expect(writeContract).toHaveBeenCalledWith(plan.request);
   });
-
-  // Plans deposit approval requirement and skips deposit simulation when allowance is short.
   it('plans deposit approval requirement and skips deposit simulation when allowance is short', async () => {
     const { divigent, simulateContract } = createDivigentWithClients({
       allowance: usdc('0.000250'),
@@ -281,8 +367,6 @@ describe('transaction planning', () => {
     });
     expect(simulateContract).not.toHaveBeenCalled();
   });
-
-  // Handles allowance boundaries without off-by-one approval mistakes.
   it('handles allowance boundaries without off-by-one approval mistakes', async () => {
     const amount = usdc('0.001');
     const cases = [
@@ -305,8 +389,6 @@ describe('transaction planning', () => {
       expect(simulateContract).toHaveBeenCalledTimes(item.simulated ? 1 : 0);
     }
   });
-
-  // Simulates deposit when allowance is sufficient.
   it('simulates deposit when allowance is sufficient', async () => {
     const { divigent, simulateContract } = createDivigentWithClients({
       allowance: usdc('0.001'),
@@ -325,8 +407,6 @@ describe('transaction planning', () => {
       args: [usdc('0.001'), OWNER, applySlippageDown(1_000_000n, 50)],
     }));
   });
-
-  // Plans withdraw using previewRedeem and fee overrides.
   it('plans withdraw using previewRedeem and fee overrides', async () => {
     const { divigent, simulateContract } = createDivigentWithClients({
       previewRedeem: usdc('2'),
