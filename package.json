@@ -1,0 +1,76 @@
+{
+  "name": "@divigent/sdk",
+  "version": "0.1.0-beta.4",
+  "description": "Divigent Protocol SDK beta - viem-native TypeScript client for the Divigent yield router on Base Sepolia",
+  "license": "MIT",
+  "author": "Divigent Protocol",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/divigent/divigent-protocol.git",
+    "directory": "sdk"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run test/unit",
+    "test:fork:base": "vitest run test/fork --testTimeout=180000 --maxWorkers=1 --pool=forks",
+    "test:integration:base": "vitest run test/integration --testTimeout=180000 --no-file-parallelism --maxWorkers=1 --pool=forks",
+    "test:x402:local": "vitest run test/integration/x402Recall.test.ts test/integration/x402Policy.test.ts --testTimeout=180000 --no-file-parallelism --maxWorkers=1 --pool=forks",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist coverage .turbo",
+    "prepublishOnly": "npm run clean && npm run typecheck && npm run build"
+  },
+  "peerDependencies": {
+    "@x402/core": "^2.0.0",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.6.0",
+    "@x402/core": "^2.11.0",
+    "@x402/evm": "^2.11.0",
+    "@x402/express": "^2.11.0",
+    "@x402/fetch": "^2.11.0",
+    "express": "^5.2.1",
+    "tsup": "^8.3.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.5.0",
+    "viem": "^2.21.0",
+    "vitest": "^4.1.5"
+  },
+  "engines": {
+    "node": ">=20.10"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta"
+  },
+  "keywords": [
+    "divigent",
+    "yield",
+    "base",
+    "base-sepolia",
+    "testnet",
+    "beta",
+    "aave",
+    "morpho",
+    "x402",
+    "ai-agents",
+    "viem"
+  ]
+}

@@ -1,0 +1,7 @@
+node_modules
+docs
+dist
+/scripts/*
+!/scripts/
+!/scripts/package-smoke.mjs
+.claude
