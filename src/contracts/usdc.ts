@@ -3,6 +3,7 @@ import { usdcAbi } from '../abis';
 import {
   DivigentError,
   PermitUnsupportedFor7702AccountError,
+  PermitUnsupportedForTokenError,
   runRead,
   runSign,
   runWrite,
@@ -66,6 +67,24 @@ export function readUsdcDecimals(
     abi: usdcAbi,
     functionName: 'decimals',
   }), usdcAbi);
+}
+
+type PermitField = 'name' | 'version' | 'nonces';
+
+async function readRequiredPermitField<T>(params: {
+  token: EvmAddress;
+  owner: EvmAddress;
+  field: PermitField;
+  read: () => Promise<T>;
+}): Promise<T> {
+  try {
+    return await runRead(params.read, usdcAbi);
+  } catch (cause) {
+    throw new PermitUnsupportedForTokenError(params.token, params.field, {
+      cause,
+      context: { owner: params.owner },
+    });
+  }
 }
 
 // Writes
@@ -158,11 +177,29 @@ export async function signUsdcPermit(params: {
     throw new PermitUnsupportedFor7702AccountError(owner);
   }
 
-  const [name, version, nonce] = await Promise.all([
-    runRead(() => publicClient.readContract({ address: usdc, abi: usdcAbi, functionName: 'name' }), usdcAbi),
-    runRead(() => publicClient.readContract({ address: usdc, abi: usdcAbi, functionName: 'version' }), usdcAbi),
-    runRead(() => publicClient.readContract({ address: usdc, abi: usdcAbi, functionName: 'nonces', args: [owner] }), usdcAbi),
-  ]);
+  const name = await readRequiredPermitField({
+    token: usdc,
+    owner,
+    field: 'name',
+    read: () => publicClient.readContract({ address: usdc, abi: usdcAbi, functionName: 'name' }),
+  });
+  const version = await readRequiredPermitField({
+    token: usdc,
+    owner,
+    field: 'version',
+    read: () => publicClient.readContract({ address: usdc, abi: usdcAbi, functionName: 'version' }),
+  });
+  const nonce = await readRequiredPermitField({
+    token: usdc,
+    owner,
+    field: 'nonces',
+    read: () => publicClient.readContract({
+      address: usdc,
+      abi: usdcAbi,
+      functionName: 'nonces',
+      args: [owner],
+    }),
+  });
 
   const signature = await runSign(() => walletClient.signTypedData({
     account,

@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { ContractFunctionRevertedError, encodeErrorResult, hashTypedData } from 'viem';
 import { routerAbi } from '../../src/abis';
 import { signUsdcPermit } from '../../src/contracts/usdc';
-import { PermitUnsupportedFor7702AccountError } from '../../src/errors';
+import {
+  PermitUnsupportedFor7702AccountError,
+  PermitUnsupportedForTokenError,
+} from '../../src/errors';
 import { getAddresses } from '../../src/core/chains';
 import {
   HASH_1,
@@ -138,6 +141,30 @@ describe('USDC permit signing', () => {
         deadline: 2_000n,
       }),
     ).rejects.toBeInstanceOf(PermitUnsupportedFor7702AccountError);
+  });
+  // Exercises: unsupported token permit fields surface as a typed fallback reason.
+  it('rejects tokens without permit metadata with a typed unsupported-token error', async () => {
+    const { publicClient, walletClient } = createMockClients({
+      readContract: (request) => {
+        if (request.functionName === 'name') return 'USD Coin';
+        if (request.functionName === 'version') throw new Error('method unavailable');
+        throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+      },
+    });
+
+    await expect(
+      signUsdcPermit({
+        walletClient,
+        publicClient,
+        usdc: addresses.usdc,
+        spender: addresses.router,
+        value: usdc('0.001'),
+        deadline: 2_000n,
+      }),
+    ).rejects.toMatchObject({
+      code: 'DIVIGENT_PERMIT_UNSUPPORTED_TOKEN',
+      field: 'version',
+    });
   });
   // Exercises: normalizes high-s signatures and flips v before returning permit parts.
   it('normalizes high-s signatures and flips v before returning permit parts', async () => {
@@ -362,11 +389,17 @@ describe('depositWithPermit behavior', () => {
   });
   // Exercises: falls back to approve, wait, then deposit for 7702/smart-account owners.
   it('falls back to approve, wait, then deposit for 7702/smart-account owners', async () => {
+    const allowances = [0n, usdc('0.001')];
     const { divigent, simulateContract, writeContract, waitForTransactionReceipt } =
       createDivigentWithClients({
         getCode: '0x1234',
         previewDeposit: 1_000_000n,
         writeHashes: [HASH_1, HASH_2],
+        readContract: (request) => {
+          if (request.functionName === 'previewDeposit') return 1_000_000n;
+          if (request.functionName === 'allowance') return allowances.shift() ?? usdc('0.001');
+          throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+        },
       });
 
     await expect(divigent.depositWithPermit({ amount: usdc('0.001') })).resolves.toBe(HASH_2);
@@ -378,6 +411,48 @@ describe('depositWithPermit behavior', () => {
     expect(waitForTransactionReceipt).toHaveBeenCalledWith({ hash: HASH_1 });
     expect(writeContract).toHaveBeenCalledTimes(2);
   });
+  // Exercises: falls back when a permit-like USDC token lacks permit metadata.
+  it('falls back to approve, wait, then deposit when permit metadata reads revert', async () => {
+    const allowances = [0n, usdc('0.001')];
+    const { divigent, simulateContract, signTypedData, writeContract, waitForTransactionReceipt } =
+      createDivigentWithClients({
+        writeHashes: [HASH_1, HASH_2],
+        readContract: (request) => {
+          if (request.functionName === 'name') return 'USD Coin';
+          if (request.functionName === 'version') throw new Error('version reverted');
+          if (request.functionName === 'nonces') return 0n;
+          if (request.functionName === 'previewDeposit') return 1_000_000n;
+          if (request.functionName === 'allowance') return allowances.shift() ?? usdc('0.001');
+          throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+        },
+      });
+
+    await expect(divigent.depositWithPermit({ amount: usdc('0.001') })).resolves.toBe(HASH_2);
+
+    expect(signTypedData).not.toHaveBeenCalled();
+    expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual([
+      'approve',
+      'deposit',
+    ]);
+    expect(waitForTransactionReceipt).toHaveBeenCalledWith({ hash: HASH_1 });
+    expect(writeContract).toHaveBeenCalledTimes(2);
+  });
+  // Exercises: skips the approval transaction when fallback allowance already covers the deposit.
+  it('skips fallback approval when existing allowance is sufficient', async () => {
+    const { divigent, simulateContract, writeContract, waitForTransactionReceipt } =
+      createDivigentWithClients({
+        getCode: '0x1234',
+        previewDeposit: 1_000_000n,
+        allowance: usdc('0.001'),
+        writeHashes: [HASH_1],
+      });
+
+    await expect(divigent.depositWithPermit({ amount: usdc('0.001') })).resolves.toBe(HASH_1);
+
+    expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual(['deposit']);
+    expect(waitForTransactionReceipt).not.toHaveBeenCalled();
+    expect(writeContract).toHaveBeenCalledTimes(1);
+  });
   // Exercises: does not fall back when fallbackOn7702 is false.
   it('does not fall back when fallbackOn7702 is false', async () => {
     const { divigent, writeContract } = createDivigentWithClients({ getCode: '0x1234' });
@@ -385,6 +460,43 @@ describe('depositWithPermit behavior', () => {
     await expect(
       divigent.depositWithPermit({ amount: usdc('0.001'), fallbackOn7702: false }),
     ).rejects.toBeInstanceOf(PermitUnsupportedFor7702AccountError);
+    expect(writeContract).not.toHaveBeenCalled();
+  });
+  // Exercises: new fallbackOnPermitUnsupported flag disables all unsupported-permit fallbacks.
+  it('does not fall back when fallbackOnPermitUnsupported is false', async () => {
+    const { divigent, writeContract } = createDivigentWithClients({ getCode: '0x1234' });
+
+    await expect(
+      divigent.depositWithPermit({ amount: usdc('0.001'), fallbackOnPermitUnsupported: false }),
+    ).rejects.toBeInstanceOf(PermitUnsupportedFor7702AccountError);
+    expect(writeContract).not.toHaveBeenCalled();
+  });
+  // Exercises: unsupported token metadata also honors the explicit no-fallback flag.
+  it('does not fall back from unsupported token permit metadata when disabled', async () => {
+    const { divigent, writeContract } = createDivigentWithClients({
+      readContract: (request) => {
+        if (request.functionName === 'previewDeposit') return 1_000_000n;
+        if (request.functionName === 'name') return 'USD Coin';
+        if (request.functionName === 'version') throw new Error('method unavailable');
+        throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+      },
+    });
+
+    await expect(
+      divigent.depositWithPermit({
+        amount: usdc('0.001'),
+        fallbackOnPermitUnsupported: false,
+      }),
+    ).rejects.toBeInstanceOf(PermitUnsupportedForTokenError);
+    expect(writeContract).not.toHaveBeenCalled();
+  });
+  // Exercises: fallback does not silently approve signer funds for a different credited wallet.
+  it('rejects permit fallback when the deposit wallet differs from the signer', async () => {
+    const { divigent, writeContract } = createDivigentWithClients({ getCode: '0x1234' });
+
+    await expect(
+      divigent.depositWithPermit({ amount: usdc('0.001'), wallet: SECOND_OWNER }),
+    ).rejects.toMatchObject({ code: 'DIVIGENT_PERMIT_FALLBACK_OWNER_MISMATCH' });
     expect(writeContract).not.toHaveBeenCalled();
   });
   // Exercises: surfaces PermitExpired from router permit-deposit simulation.

@@ -59,8 +59,11 @@ export type {
 } from './types';
 export type {
   FailureContext,
+  IdleDepositContext,
   PaymentContext,
   PaymentCreatedContext,
+  X402AttachHandle,
+  X402AutoDepositOptions,
   X402PolicyContext,
   X402ResourceCap,
   X402ResourcePattern,
@@ -99,6 +102,7 @@ export {
   PanicError,
   PaymentCapExceededError,
   PermitUnsupportedFor7702AccountError,
+  PermitUnsupportedForTokenError,
   ReceiptParseError,
   RequireError,
   ContractRevertError,

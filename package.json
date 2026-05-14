@@ -1,6 +1,6 @@
 {
   "name": "@divigent/sdk",
-  "version": "0.1.0-beta.4",
+  "version": "0.1.0-beta.6",
   "description": "Divigent Protocol SDK beta - viem-native TypeScript client for the Divigent yield router on Base Sepolia",
   "license": "MIT",
   "author": "Divigent Protocol",
@@ -22,6 +22,7 @@
   },
   "files": [
     "dist",
+    "examples",
     "README.md"
   ],
   "sideEffects": false,

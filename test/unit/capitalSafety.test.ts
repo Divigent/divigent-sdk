@@ -205,10 +205,10 @@ describe('capital safety invariants', () => {
 
       if (idle < usdc('0.000050')) {
         expect(txHash).toBeUndefined();
-        expect(divigent.depositWithPermit).not.toHaveBeenCalled();
+        expect(divigent.depositWithPermitAndWait).not.toHaveBeenCalled();
       } else {
         expect(txHash).toBe(HASH_1);
-        expect(divigent.depositWithPermit).toHaveBeenCalledWith({
+        expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
           amount: idle,
           wallet: OWNER,
         });

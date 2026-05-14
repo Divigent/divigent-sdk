@@ -1,5 +1,6 @@
 import type { DivigentError } from '../errors';
 import type { EvmAddress, Prettify, TxHash } from '../types';
+import type { x402HTTPClient } from '@x402/core/client';
 
 /** @notice Observer payload for Divigent's pre-payment x402 recall hook. */
 export type PaymentContext = {
@@ -18,8 +19,9 @@ export type PaymentContext = {
   recallShares?: bigint;
   recallTxHash?: TxHash;
   /**
-   * @notice Set when an attempted recall withdraw failed. The SDK falls
-   * through and lets x402 pay from whatever USDC is currently liquid.
+   * @notice Set when an attempted recall withdraw failed. If the wallet still
+   * has enough liquid USDC for the payment, the SDK lets x402 proceed and
+   * reports the degraded reserve here. If not, the hook aborts before signing.
    */
   recallError?: unknown;
 };
@@ -45,6 +47,24 @@ export type FailureContext = Prettify<{
   redepositTxHash?: TxHash;
   /** @notice Amount that the failure hook moved back into the vault. */
   redepositAmount?: bigint;
+}>;
+
+/** @notice Observer payload for successful post-settlement idle USDC deposits. */
+export type IdleDepositContext = Prettify<{
+  /** @notice Wallet address whose idle USDC was deposited. */
+  wallet: EvmAddress | string;
+  /** @notice Wallet USDC balance before the idle deposit. */
+  walletBalance: bigint;
+  /** @notice Reserve floor intentionally left liquid in the wallet. */
+  reserveFloor: bigint;
+  /** @notice Extra USDC kept liquid while the x402 settlement debit propagates. */
+  settlementReserve?: bigint;
+  /** @notice USDC amount deposited into Divigent. */
+  idleAmount: bigint;
+  /** @notice Hash of the Divigent deposit transaction. */
+  txHash: TxHash;
+  /** @notice Settlement transaction or caller-provided dedupe key, when present. */
+  dedupeKey?: string;
 }>;
 
 /** @notice Non-fatal integration error surfaced by Divigent hooks/wrappers. */
@@ -119,4 +139,44 @@ export type X402WrapConfig = {
   onAfterPaymentCreation?: (ctx: PaymentCreatedContext) => void | Promise<void>;
   /** @notice Fires when x402 payment-payload creation fails. */
   onPaymentFailure?: (ctx: FailureContext) => void | Promise<void>;
+};
+
+/** @notice Options for post-settlement automatic idle deposits. */
+export type X402AutoDepositOptions = {
+  /** @notice Maximum number of settled transaction keys remembered for dedupe. */
+  dedupeCapacity?: number;
+  /** @notice Existing dedupe set for shared integrations. */
+  seenTxHashes?: Set<string>;
+  /**
+   * @notice Skip deposits below this amount. Public wrappers default to the
+   * router's on-chain `MIN_DEPOSIT` to avoid dust deposit reverts.
+   */
+  minDeposit?: bigint | (() => bigint | Promise<bigint>);
+  /** @notice Wait for the idle deposit before returning the paid response. */
+  waitForIdleDeposit?: boolean;
+  /** @notice Fires after wallet USDC above the reserve floor is deposited. */
+  onIdleDeposit?: (ctx: IdleDepositContext) => void | Promise<void>;
+  /** @notice Receives non-fatal idle-deposit observer errors. */
+  onNonFatalError?: (ctx: IntegrationErrorContext) => void | Promise<void>;
+};
+
+/** @notice Handle returned by `divigent.attachTo(x402Client, config)`. */
+export type X402AttachHandle = {
+  /** @notice Detach Divigent's x402 recall hooks from the client. */
+  detach: () => void;
+  /**
+   * @notice Wrap a payment-enabled fetch so successful x402 settlements deposit
+   * wallet USDC above the reserve floor back into Divigent.
+   */
+  wrapFetchWithYield: (
+    fetchWithPayment: typeof fetch,
+    http: x402HTTPClient,
+    options?: X402AutoDepositOptions,
+  ) => typeof fetch;
+  /**
+   * @notice Deposit current wallet USDC above the reserve floor into Divigent.
+   *
+   * @remarks Useful for callers that decode settlement responses themselves.
+   */
+  depositIdle: (options?: X402AutoDepositOptions) => Promise<TxHash | undefined>;
 };

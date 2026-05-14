@@ -15,6 +15,7 @@ import {
   DivigentError,
   OperatorAckRequiredError,
   PermitUnsupportedFor7702AccountError,
+  PermitUnsupportedForTokenError,
   runRead,
   runWrite,
   ZeroAddressError,
@@ -39,9 +40,9 @@ import type {
 } from './types';
 import type { x402Client } from '@x402/core/client';
 import { applySlippageDown } from './core/utils';
-import { attachDivigentYield } from './x402/attach';
+import { createX402AttachHandle } from './x402/handle';
 import type { FeeOverrides } from './types';
-import type { X402WrapConfig } from './x402/types';
+import type { X402AttachHandle, X402WrapConfig } from './x402/types';
 import { parseDepositReceipt, parseWithdrawReceipt } from './core/receipts';
 import {
   approveUsdc,
@@ -88,6 +89,7 @@ import {
   readRouterFeeCollector,
   readRouterIsAuthorized,
   readRouterIsOperator,
+  readRouterMinDeposit,
   readRouterNonce,
   readRouterOracle,
   readRouterPosition,
@@ -181,7 +183,9 @@ export type DepositParams = {
 export type DepositWithPermitParams = DepositParams & {
   /** @notice Permit deadline. Defaults to current chain time plus one hour. */
   deadline?: bigint;
-  /** @notice If true, 7702 accounts fall back to `approveUsdc + deposit`. Defaults to true. */
+  /** @notice If true, unsupported permit paths fall back to `approveUsdc + deposit`. Defaults to true. */
+  fallbackOnPermitUnsupported?: boolean;
+  /** @deprecated Use `fallbackOnPermitUnsupported`. Kept for beta compatibility. */
   fallbackOn7702?: boolean;
 };
 
@@ -269,6 +273,10 @@ function withFeeOverrides(
   fees: FeeOverrides | undefined,
 ): DivigentWriteRequest {
   return (fees ? { ...(request as object), ...fees } : request) as DivigentWriteRequest;
+}
+
+function sameAddress(a: EvmAddress, b: EvmAddress): boolean {
+  return getAddress(a) === getAddress(b);
 }
 
 /** @notice Main viem-native facade for Divigent reads, writes, signing, and x402 hooks. */
@@ -509,6 +517,14 @@ export class Divigent {
    */
   currentTVLCap(): Promise<bigint> {
     return readRouterCurrentTVLCap(this.publicClient, this.addresses.router);
+  }
+
+  /**
+   * @notice Read the router's minimum accepted USDC deposit.
+   * @returns Minimum deposit in USDC atomic units.
+   */
+  minDeposit(): Promise<bigint> {
+    return readRouterMinDeposit(this.publicClient, this.addresses.router);
   }
 
   /**
@@ -911,13 +927,14 @@ export class Divigent {
   /**
    * @notice Sign a USDC permit and deposit in one router transaction.
    * @remarks The SDK serializes permit calls per owner to avoid nonce
-   * collisions. 7702 accounts can fall back to `approveUsdc + deposit`.
+   * collisions. Unsupported permit paths can fall back to
+   * `approveUsdc + deposit`.
    * @param params Deposit amount, optional wallet/deadline, 7702 fallback flag, and optional fees.
    * @returns Transaction hash.
    */
   async depositWithPermit(params: DepositWithPermitParams): Promise<TxHash> {
     const wallet = params.wallet ?? this.defaultWallet();
-    const fallback = params.fallbackOn7702 ?? true;
+    const fallback = params.fallbackOnPermitUnsupported ?? params.fallbackOn7702 ?? true;
     const minSharesOut = await this.resolveMinSharesOut(params);
 
     return this.queuePermit(wallet, async () => {
@@ -942,9 +959,28 @@ export class Divigent {
           owner: wallet,
         });
       } catch (err) {
-        if (fallback && err instanceof PermitUnsupportedFor7702AccountError) {
-          const approveHash = await this.approveUsdc(params.amount, params.fees);
-          await this.waitForReceipt(approveHash);
+        const permitUnsupported = (
+          err instanceof PermitUnsupportedFor7702AccountError ||
+          err instanceof PermitUnsupportedForTokenError
+        );
+        if (fallback && permitUnsupported) {
+          const approvalOwner = this.requireSigner().account.address as EvmAddress;
+          if (!sameAddress(approvalOwner, wallet)) {
+            throw new DivigentError(
+              '[@divigent/sdk] permit fallback requires the deposit wallet to match the signer. ' +
+                'Call approveUsdc() + deposit() explicitly when funding a different wallet.',
+              {
+                code: 'DIVIGENT_PERMIT_FALLBACK_OWNER_MISMATCH',
+                category: 'validation',
+                context: { signer: approvalOwner, wallet },
+              },
+            );
+          }
+          const allowance = await this.usdcAllowance(approvalOwner);
+          if (allowance < params.amount) {
+            const approveHash = await this.approveUsdc(params.amount, params.fees);
+            await this.waitForReceipt(approveHash);
+          }
           return this.deposit({
             amount: params.amount,
             wallet,
@@ -1184,9 +1220,9 @@ export class Divigent {
    * @notice Attach Divigent recall hooks to an existing x402 client.
    * @param client Existing x402 client instance.
    * @param config Divigent x402 policy and observer config.
-   * @returns Detach handle.
+   * @returns x402 attach handle.
    */
-  attachTo(client: x402Client, config: X402WrapConfig = {}): { detach: () => void } {
-    return attachDivigentYield(client, this, config);
+  attachTo(client: x402Client, config: X402WrapConfig = {}): X402AttachHandle {
+    return createX402AttachHandle(client, this, config);
   }
 }

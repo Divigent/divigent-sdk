@@ -83,6 +83,7 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
     if (functionName === 'previewRedeem') return opts.previewRedeem ?? usdc('2');
     if (functionName === 'previewWithdrawNet') return opts.previewWithdrawNet ?? 500_000n;
     if (functionName === 'getRecommendedRoute') return opts.recommendedRoute ?? 0;
+    if (functionName === 'MIN_DEPOSIT') return usdc('10');
     if (functionName === 'allowance') return opts.allowance ?? 0n;
     if (functionName === 'balanceOf') {
       const reqAddress = String(request.address).toLowerCase();
@@ -242,6 +243,7 @@ export type MockX402Divigent = Divigent & {
   previewWithdrawNet: ReturnType<typeof vi.fn>;
   withdrawAndWait: ReturnType<typeof vi.fn>;
   depositWithPermit: ReturnType<typeof vi.fn>;
+  depositWithPermitAndWait: ReturnType<typeof vi.fn>;
 };
 
 export type MockX402DivigentOptions = {
@@ -284,6 +286,11 @@ export function createX402Divigent(opts: MockX402DivigentOptions = {}): MockX402
       if (opts.depositRejects) throw new Error('deposit failed');
       if (amount <= 0n) throw new Error('invalid deposit');
       return HASH_1;
+    }),
+    depositWithPermitAndWait: vi.fn(async ({ amount }: { amount: bigint }) => {
+      if (opts.depositRejects) throw new Error('deposit failed');
+      if (amount <= 0n) throw new Error('invalid deposit');
+      return { txHash: HASH_1, sharesMinted: amount };
     }),
   } as unknown as MockX402Divigent;
 }
