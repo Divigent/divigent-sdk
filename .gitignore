@@ -5,3 +5,5 @@ dist
 !/scripts/
 !/scripts/package-smoke.mjs
 .claude
+examples
+gitbook

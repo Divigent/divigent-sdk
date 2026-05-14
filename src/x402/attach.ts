@@ -216,6 +216,7 @@ export function attachX402HooksWithReserveFloor(
         const balance = await divigent.usdcBalance(owner);
         const needed = paymentAmount + floor;
         const deficit = balance >= needed ? 0n : needed - balance;
+        let liquidBalance = balance;
 
         let recallShares: bigint | undefined;
         let recallTxHash: TxHash | undefined;
@@ -225,14 +226,15 @@ export function attachX402HooksWithReserveFloor(
           try {
             const sharesNeeded = await divigent.previewWithdrawNet(deficit, owner);
             if (sharesNeeded > 0n) {
-              recallShares = sharesNeeded;
               const recalled = await divigent.withdrawAndWait({
                 shares: sharesNeeded,
                 wallet: owner,
                 slippageBps,
               });
+              recallShares = sharesNeeded;
               recallTxHash = recalled.txHash;
               await waitForUsdcBalanceAtLeast(divigent, owner, needed);
+              liquidBalance = needed;
               recallByRequired.set(
                 raw.paymentRequired as object,
                 { owner, recallShares: sharesNeeded, balanceBefore: balance },
@@ -240,6 +242,11 @@ export function attachX402HooksWithReserveFloor(
             }
           } catch (err) {
             recallError = err;
+            try {
+              liquidBalance = await divigent.usdcBalance(owner);
+            } catch {
+              liquidBalance = balance;
+            }
           }
         }
 
@@ -255,9 +262,35 @@ export function attachX402HooksWithReserveFloor(
           ...(recallError !== undefined && { recallError }),
         };
         await safeObserver(config.onBeforePayment, ctx, 'onBeforePayment', config.onNonFatalError);
+
+        if (deficit > 0n && liquidBalance < paymentAmount) {
+          throw new DivigentError(
+            '[@divigent/sdk] x402 recall could not make enough USDC liquid for payment',
+            {
+              cause: recallError,
+              code: 'DIVIGENT_X402_RECALL_INSUFFICIENT_LIQUIDITY',
+              category: 'x402',
+              retryable: true,
+              context: {
+                wallet: owner,
+                paymentAmount,
+                walletBalance: liquidBalance,
+                initialWalletBalance: balance,
+                reserveFloor: floor,
+                deficit,
+              },
+            },
+          );
+        }
       });
     } catch (err) {
       handledByRequired.delete(key);
+      if (
+        isDivigentError(err) &&
+        err.code === 'DIVIGENT_X402_RECALL_INSUFFICIENT_LIQUIDITY'
+      ) {
+        throw err;
+      }
       await reportNonFatal(config.onNonFatalError, {
         phase: 'x402-before-hook',
         error: err,

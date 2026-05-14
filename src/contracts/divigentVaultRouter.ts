@@ -111,6 +111,17 @@ export function readRouterCurrentTVLCap(
   }), routerAbi);
 }
 
+export function readRouterMinDeposit(
+  client: PublicClient,
+  router: EvmAddress,
+): Promise<bigint> {
+  return runRead(() => client.readContract({
+    address: router,
+    abi: routerAbi,
+    functionName: 'MIN_DEPOSIT',
+  }), routerAbi);
+}
+
 export function readRouterCostBasis(
   client: PublicClient,
   router: EvmAddress,

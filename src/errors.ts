@@ -256,6 +256,31 @@ export class PermitUnsupportedFor7702AccountError extends DivigentError {
 }
 
 /**
+ * @notice Token does not expose the permit fields required by the USDC EIP-2612 path.
+ */
+export class PermitUnsupportedForTokenError extends DivigentError {
+  constructor(
+    public readonly token: EvmAddress,
+    public readonly field: 'name' | 'version' | 'nonces',
+    options?: DivigentErrorOptions,
+  ) {
+    super(
+      `Token ${token} does not expose a compatible EIP-2612 permit field: ${field}. ` +
+        'Use approveUsdc() + deposit() instead.',
+      withDefaults(
+        {
+          code: 'DIVIGENT_PERMIT_UNSUPPORTED_TOKEN',
+          category: 'contract',
+          context: { token, field },
+        },
+        options,
+      ),
+    );
+    this.name = 'PermitUnsupportedForTokenError';
+  }
+}
+
+/**
  * @notice Caller must explicitly acknowledge operator withdrawal authority.
  */
 export class OperatorAckRequiredError extends DivigentError {

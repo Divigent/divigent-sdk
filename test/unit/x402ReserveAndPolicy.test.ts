@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { baseSepolia } from 'viem/chains';
-import { AlreadyAttachedError, PaymentCapExceededError } from '../../src/errors';
+import { AlreadyAttachedError, DivigentError, PaymentCapExceededError } from '../../src/errors';
 import { attachDivigentYield } from '../../src/x402/attach';
 import { ReserveFloor } from '../../src/x402/attach';
 import {
@@ -365,7 +365,7 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     const { client, hooks } = createX402Client();
     const onBeforePayment = vi.fn();
     const divigent = createX402Divigent({
-      balances: [usdc('0.1')],
+      balances: [usdc('1.1')],
       previewWithdrawNet: 0n,
     });
     attachDivigentYield(client as never, divigent, {
@@ -375,10 +375,10 @@ describe('x402 recall hook policy and liquidity behavior', () => {
 
     await hooks.before?.(x402PaymentContext({ amount: usdc('1') }));
 
-    expect(divigent.previewWithdrawNet).toHaveBeenCalledWith(usdc('1.4'), OWNER);
+    expect(divigent.previewWithdrawNet).toHaveBeenCalledWith(usdc('0.4'), OWNER);
     expect(divigent.withdrawAndWait).not.toHaveBeenCalled();
     expect(onBeforePayment).toHaveBeenCalledWith(expect.objectContaining({
-      deficit: usdc('1.4'),
+      deficit: usdc('0.4'),
     }));
     expect(onBeforePayment.mock.calls[0]?.[0]).not.toHaveProperty('recallShares');
   });
@@ -397,7 +397,13 @@ describe('x402 recall hook policy and liquidity behavior', () => {
       onBeforePayment,
     });
 
-    const pending = hooks.before?.(x402PaymentContext({ amount: usdc('1') }));
+    const pending = expect(
+      hooks.before?.(x402PaymentContext({ amount: usdc('1') })),
+    ).rejects.toMatchObject({
+      code: 'DIVIGENT_X402_RECALL_INSUFFICIENT_LIQUIDITY',
+      category: 'x402',
+      retryable: true,
+    });
     await vi.advanceTimersByTimeAsync(60_001);
     await pending;
 
@@ -612,12 +618,38 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     }));
   });
 
-  // Exercises: surfaces recall failures as observer context without blocking x402 payment creation.
-  it('surfaces recall failures as observer context without blocking x402 payment creation', async () => {
+  // Exercises: blocks payment creation when recall fails and the wallet cannot fund x402.
+  it('blocks payment creation when recall fails and the wallet cannot fund x402', async () => {
     const { client, hooks } = createX402Client();
     const onBeforePayment = vi.fn();
     const divigent = createX402Divigent({
-      balances: [usdc('0.1')],
+      balances: [usdc('0.1'), usdc('0.1')],
+      withdrawRejects: true,
+    });
+    attachDivigentYield(client as never, divigent, {
+      minIdleThreshold: usdc('0.5'),
+      onBeforePayment,
+    });
+
+    const payment = hooks.before?.(x402PaymentContext({ amount: usdc('1') }));
+    await expect(payment).rejects.toBeInstanceOf(DivigentError);
+    await expect(payment).rejects.toMatchObject({
+      code: 'DIVIGENT_X402_RECALL_INSUFFICIENT_LIQUIDITY',
+      category: 'x402',
+      retryable: true,
+    });
+    expect(onBeforePayment).toHaveBeenCalledWith(expect.objectContaining({
+      deficit: usdc('1.4'),
+      recallError: expect.any(Error),
+    }));
+  });
+
+  // Exercises: lets x402 proceed when recall fails but liquid USDC can still fund the payment.
+  it('surfaces recall failures without blocking when liquid USDC can still fund x402', async () => {
+    const { client, hooks } = createX402Client();
+    const onBeforePayment = vi.fn();
+    const divigent = createX402Divigent({
+      balances: [usdc('1.1'), usdc('1.1')],
       withdrawRejects: true,
     });
     attachDivigentYield(client as never, divigent, {
@@ -629,7 +661,7 @@ describe('x402 recall hook policy and liquidity behavior', () => {
       hooks.before?.(x402PaymentContext({ amount: usdc('1') })),
     ).resolves.toBeUndefined();
     expect(onBeforePayment).toHaveBeenCalledWith(expect.objectContaining({
-      deficit: usdc('1.4'),
+      deficit: usdc('0.4'),
       recallError: expect.any(Error),
     }));
   });
