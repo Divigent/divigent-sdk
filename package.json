@@ -1,7 +1,7 @@
 {
   "name": "@divigent/sdk",
-  "version": "0.1.0-beta.6",
-  "description": "Divigent Protocol SDK beta - viem-native TypeScript client for the Divigent yield router on Base Sepolia",
+  "version": "1.0.0",
+  "description": "Viem-native TypeScript SDK for Divigent on Base and Base Sepolia",
   "license": "MIT",
   "author": "Divigent Protocol",
   "repository": {
@@ -22,7 +22,6 @@
   },
   "files": [
     "dist",
-    "examples",
     "README.md"
   ],
   "sideEffects": false,
@@ -31,7 +30,7 @@
     "test": "vitest run test/unit",
     "test:fork:base": "vitest run test/fork --testTimeout=180000 --maxWorkers=1 --pool=forks",
     "test:integration:base": "vitest run test/integration --testTimeout=180000 --no-file-parallelism --maxWorkers=1 --pool=forks",
-    "test:x402:local": "vitest run test/integration/x402Recall.test.ts test/integration/x402Policy.test.ts --testTimeout=180000 --no-file-parallelism --maxWorkers=1 --pool=forks",
+    "test:x402:local": "node scripts/run-x402-local-tests.mjs",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist coverage .turbo",
     "prepublishOnly": "npm run clean && npm run typecheck && npm run build"
@@ -59,15 +58,15 @@
   },
   "publishConfig": {
     "access": "public",
-    "tag": "beta"
+    "tag": "latest"
   },
   "keywords": [
     "divigent",
     "yield",
     "base",
+    "mainnet",
     "base-sepolia",
     "testnet",
-    "beta",
     "aave",
     "morpho",
     "x402",

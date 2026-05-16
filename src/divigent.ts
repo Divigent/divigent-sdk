@@ -4,6 +4,7 @@ import { routerAbi, usdcAbi } from './abis';
 import {
   CHAINS,
   assertProtocolDeployed,
+  chainFromId,
   type ContractAddresses,
   type DivigentChain,
   getAddresses,
@@ -39,10 +40,21 @@ import type {
   WithdrawResult,
 } from './types';
 import type { x402Client } from '@x402/core/client';
+import type { x402ResourceServer } from '@x402/core/server';
 import { applySlippageDown } from './core/utils';
-import { createX402AttachHandle } from './x402/handle';
+import {
+  createX402AttachHandle,
+  createX402IncomeAttachHandle,
+  depositIdleWithReserveFloor,
+} from './x402/handle';
 import type { FeeOverrides } from './types';
-import type { X402AttachHandle, X402WrapConfig } from './x402/types';
+import type {
+  X402AttachHandle,
+  X402IdleDepositOptions,
+  X402IncomeAttachHandle,
+  X402IncomeConfig,
+  X402WrapConfig,
+} from './x402/types';
 import { parseDepositReceipt, parseWithdrawReceipt } from './core/receipts';
 import {
   approveUsdc,
@@ -149,7 +161,11 @@ export type DivigentConfig = {
   publicClient: PublicClient;
   /** @notice viem wallet client required for writes, signing, and x402 recall hooks. */
   walletClient?: WalletClient | undefined;
-  /** @notice Supported deployment chain. Defaults to `base-sepolia` for the beta. */
+  /**
+   * @notice Supported deployment chain.
+   * @remarks If omitted, the SDK infers from bound viem client chains when possible,
+   * then falls back to `base-sepolia` for backwards compatibility.
+   */
   chain?: DivigentChain | undefined;
   /** @notice Optional custom deployment addresses for private/test deployments. */
   addresses?: ContractAddresses | undefined;
@@ -185,7 +201,7 @@ export type DepositWithPermitParams = DepositParams & {
   deadline?: bigint;
   /** @notice If true, unsupported permit paths fall back to `approveUsdc + deposit`. Defaults to true. */
   fallbackOnPermitUnsupported?: boolean;
-  /** @deprecated Use `fallbackOnPermitUnsupported`. Kept for beta compatibility. */
+  /** @deprecated Use `fallbackOnPermitUnsupported`. Kept for backwards compatibility. */
   fallbackOn7702?: boolean;
 };
 
@@ -264,6 +280,12 @@ export type SignInitializeForParams = {
   deadline: bigint;
 };
 
+/** @notice Parameters for initializing the connected Divigent wallet if needed. */
+export type EnsureInitializedParams = WaitOptions & {
+  /** @notice Wallet to check. Defaults to the bound wallet client account. */
+  wallet?: EvmAddress;
+};
+
 // Stablecoin vault PPS drift is normally tiny; 10 bps is a tight default for
 // user-initiated exits. The x402 recall path uses a wider payment-safe margin.
 const DEFAULT_SLIPPAGE_BPS = 10;
@@ -277,6 +299,21 @@ function withFeeOverrides(
 
 function sameAddress(a: EvmAddress, b: EvmAddress): boolean {
   return getAddress(a) === getAddress(b);
+}
+
+function resolveChain(config: DivigentConfig): DivigentChain {
+  if (config.chain !== undefined) return config.chain;
+
+  const publicChainId = config.publicClient.chain?.id;
+  const walletChainId = config.walletClient?.chain?.id;
+  const publicChain = publicChainId === undefined ? undefined : chainFromId(publicChainId);
+  const walletChain = walletChainId === undefined ? undefined : chainFromId(walletChainId);
+
+  if (publicChain !== undefined && walletChain !== undefined && publicChain !== walletChain) {
+    throw new ChainMismatchError(CHAINS[publicChain].id, CHAINS[walletChain].id, 'walletClient');
+  }
+
+  return publicChain ?? walletChain ?? 'base-sepolia';
 }
 
 /** @notice Main viem-native facade for Divigent reads, writes, signing, and x402 hooks. */
@@ -309,7 +346,7 @@ export class Divigent {
    * @throws If the selected deployment is missing required contract addresses.
    */
   static create(config: DivigentConfig): Divigent {
-    const chain = config.chain ?? 'base-sepolia';
+    const chain = resolveChain(config);
     const expectedChainId = CHAINS[chain].id;
 
     if (config.walletClient?.chain && config.walletClient.chain.id !== expectedChainId) {
@@ -738,6 +775,37 @@ export class Divigent {
       publicClient: this.publicClient,
       router: this.addresses.router,
     });
+  }
+
+  /**
+   * @notice Initialize the connected wallet if it is not already authorized.
+   * @param params Optional wallet check and receipt wait options.
+   * @returns Initialization transaction hash, or `undefined` when already initialized.
+   */
+  async ensureInitializedAndWait(params: EnsureInitializedParams = {}): Promise<TxHash | undefined> {
+    const wallet = params.wallet ?? this.defaultWallet();
+    if (await this.isAuthorized(wallet)) return undefined;
+
+    const signer = this.defaultWallet();
+    if (wallet.toLowerCase() !== signer.toLowerCase()) {
+      throw new DivigentError(
+        '[@divigent/sdk] ensureInitializedAndWait can only initialize the connected signer wallet. ' +
+          'Use initializeFor() when initializing a different wallet.',
+        {
+          code: 'DIVIGENT_WALLET_MISMATCH',
+          category: 'wallet',
+          context: { wallet, signer },
+        },
+      );
+    }
+
+    const hash = await this.initialize();
+    const waitOptions: WaitOptions = {};
+    if (params.confirmations !== undefined) waitOptions.confirmations = params.confirmations;
+    if (params.pollingInterval !== undefined) waitOptions.pollingInterval = params.pollingInterval;
+    if (params.timeout !== undefined) waitOptions.timeout = params.timeout;
+    await this.waitForReceipt(hash, waitOptions);
+    return hash;
   }
 
   /**
@@ -1224,5 +1292,27 @@ export class Divigent {
    */
   attachTo(client: x402Client, config: X402WrapConfig = {}): X402AttachHandle {
     return createX402AttachHandle(client, this, config);
+  }
+
+  /**
+   * @notice Attach Divigent income deposit hooks to an existing x402 resource server.
+   * @param server Existing x402 resource server instance.
+   * @param config Seller-side reserve and observer config.
+   * @returns x402 income attach handle.
+   */
+  attachToResourceServer(
+    server: x402ResourceServer,
+    config: X402IncomeConfig = {},
+  ): X402IncomeAttachHandle {
+    return createX402IncomeAttachHandle(server, this, config);
+  }
+
+  /**
+   * @notice Deposit wallet USDC above a reserve floor into Divigent.
+   * @param options Wallet, reserve, threshold, and observer options.
+   * @returns Deposit transaction hash, or `undefined` when no sweep occurs.
+   */
+  depositIdle(options: X402IdleDepositOptions = {}): Promise<TxHash | undefined> {
+    return depositIdleWithReserveFloor(this, options);
   }
 }

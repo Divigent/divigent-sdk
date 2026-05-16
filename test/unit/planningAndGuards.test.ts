@@ -12,6 +12,7 @@ import {
   ZeroAddressError,
 } from '../../src/errors';
 import { applySlippageDown } from '../../src/core/utils';
+import { getAddresses, isZeroAddress } from '../../src/core/chains';
 import {
   HASH_1,
   HASH_2,
@@ -78,18 +79,41 @@ describe('Divigent config and wallet guards', () => {
     })))
       .rejects.toMatchObject({ code: 'DIVIGENT_WALLET_CLIENT_REQUIRED' });
   });
-  // Exercises: requires explicit deployment addresses for Base mainnet until canonical addresses exist.
-  it('requires explicit deployment addresses for Base mainnet until canonical addresses exist', () => {
+  // Exercises: ships canonical Base mainnet protocol addresses.
+  it('creates a Base mainnet facade from the built-in address registry', () => {
     const { publicClient, walletClient } = createMockClients({
       publicChainId: base.id,
       walletChainId: base.id,
     });
 
-    expect(() => Divigent.create({
+    const divigent = Divigent.create({
       publicClient,
       walletClient,
       chain: 'base',
-    })).toThrow(DivigentError);
+    });
+
+    expect(divigent.chain).toBe('base');
+    const mainnet = getAddresses('base');
+    expect(mainnet.router).toBe('0xE958A89c2CCa697d4896990685800cc1D5AF2A01');
+    expect(mainnet.oracle).toBe('0x3Ba775E8fAE60E72c99dE10C720fC44ab38BF71A');
+    expect(mainnet.feeCollector).toBe('0x1a2eF76E6E323D95f836917f812f6D159c3A0960');
+    expect(mainnet.dvUsdc).toBe('0x1497f7F3b156e110b1d90BC7F1759F40fb48Ea4F');
+    expect(mainnet.usdc).toBe('0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913');
+    expect(isZeroAddress(mainnet.router)).toBe(false);
+    expect(isZeroAddress(mainnet.oracle)).toBe(false);
+    expect(isZeroAddress(mainnet.feeCollector)).toBe(false);
+    expect(isZeroAddress(mainnet.dvUsdc)).toBe(false);
+  });
+  // Exercises: infers the deployment chain from bound viem clients when callers omit `chain`.
+  it('infers Base mainnet from viem client chain ids when chain is omitted', () => {
+    const { publicClient, walletClient } = createMockClients({
+      publicChainId: base.id,
+      walletChainId: base.id,
+    });
+
+    const divigent = Divigent.create({ publicClient, walletClient });
+
+    expect(divigent.chain).toBe('base');
   });
   // Exercises: validates custom address overrides before any on-chain call.
   it('validates custom address overrides before any on-chain call', () => {
@@ -131,6 +155,45 @@ describe('configured deployment self-checks', () => {
     });
 
     await expect(divigent.verifyAddresses()).rejects.toBeInstanceOf(AddressMismatchError);
+  });
+});
+
+describe('wallet initialization convenience', () => {
+  // Exercises: skips initialization when the wallet is already authorized.
+  it('does not broadcast when the wallet is already initialized', async () => {
+    const { divigent, writeContract } = createDivigentWithClients({ isAuthorized: true });
+
+    await expect(divigent.ensureInitializedAndWait()).resolves.toBeUndefined();
+    expect(writeContract).not.toHaveBeenCalled();
+  });
+
+  // Exercises: initializes the connected signer and waits for the receipt.
+  it('initializes the connected signer and waits for the receipt', async () => {
+    const { divigent, simulateContract, writeContract, waitForTransactionReceipt } = createDivigentWithClients();
+
+    await expect(
+      divigent.ensureInitializedAndWait({ confirmations: 2, pollingInterval: 50 }),
+    ).resolves.toBe(HASH_1);
+
+    expect(simulateContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'initialize',
+    }));
+    expect(writeContract).toHaveBeenCalledTimes(1);
+    expect(waitForTransactionReceipt).toHaveBeenCalledWith({
+      hash: HASH_1,
+      confirmations: 2,
+      pollingInterval: 50,
+    });
+  });
+
+  // Exercises: refuses to initialize a different wallet with the signer-only helper.
+  it('rejects a non-signer wallet for signer-only initialization', async () => {
+    const { divigent, writeContract } = createDivigentWithClients();
+
+    await expect(divigent.ensureInitializedAndWait({ wallet: SECOND_OWNER })).rejects.toMatchObject({
+      code: 'DIVIGENT_WALLET_MISMATCH',
+    });
+    expect(writeContract).not.toHaveBeenCalled();
   });
 });
 

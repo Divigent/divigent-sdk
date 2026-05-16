@@ -1,17 +1,18 @@
 # @divigent/sdk
 
-Divigent Protocol SDK beta for the Base Sepolia testnet.
+Viem-native TypeScript SDK for the Divigent yield router on Base mainnet and
+Base Sepolia.
 
-## Beta Notice
+## Mainnet Notice
 
-This package is in beta and is still under security review and testing. It is
-published for Base Sepolia testnet integration only. Do not use this beta SDK
-with mainnet funds.
+Mainnet support uses real Base USDC and broadcasts real transactions. Keep
+launch caps small, verify the configured addresses with `verifyAddresses()`,
+and test on Base Sepolia or a Base fork before moving meaningful funds.
 
 ## Install
 
 ```bash
-npm install @divigent/sdk@beta viem @x402/core
+npm install @divigent/sdk viem @x402/core
 ```
 
 Requires Node.js 20.10 or newer.
@@ -22,20 +23,21 @@ Requires Node.js 20.10 or newer.
 import { Divigent, evmAddress, formatUsdc, parseUsdc } from '@divigent/sdk';
 import { createPublicClient, createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { baseSepolia } from 'viem/chains';
+import { base } from 'viem/chains';
 
-const rpcUrl = process.env.BASE_SEPOLIA_RPC_URL!;
+const rpcUrl = process.env.BASE_MAINNET_RPC_URL!;
 const account = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
 
-const publicClient = createPublicClient({ chain: baseSepolia, transport: http(rpcUrl) });
-const walletClient = createWalletClient({ account, chain: baseSepolia, transport: http(rpcUrl) });
+const publicClient = createPublicClient({ chain: base, transport: http(rpcUrl) });
+const walletClient = createWalletClient({ account, chain: base, transport: http(rpcUrl) });
 
-const divigent = Divigent.create({ publicClient, walletClient });
+const divigent = Divigent.create({ publicClient, walletClient, chain: 'base' });
+await divigent.verifyAddresses();
 
 const position = await divigent.getPosition(evmAddress(account.address));
 console.log(formatUsdc(position.currentValue));
 
-// Warning: these broadcast real Base Sepolia transactions.
+// Warning: these broadcast real Base mainnet transactions.
 const amount = parseUsdc('1');
 await divigent.approveUsdc(amount);
 const txHash = await divigent.deposit({ amount });
@@ -50,8 +52,16 @@ Import from the package root:
 import { Divigent, parseUsdc, formatUsdc, evmAddress } from '@divigent/sdk';
 ```
 
-`Divigent.create(config)` creates the SDK facade. The beta supports Base
-Sepolia only and defaults to `base-sepolia`.
+`Divigent.create(config)` creates the SDK facade. The SDK supports Base mainnet
+with `chain: 'base'` and Base Sepolia with `chain: 'base-sepolia'`.
+If omitted, `chain` is inferred from bound viem clients when possible and then
+falls back to `base-sepolia` for backwards compatibility. Production code
+should still set the chain explicitly.
+
+Built-in deployments:
+
+- `base`: Base mainnet, Circle USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`
+- `base-sepolia`: Base Sepolia test deployment
 
 Common read methods:
 
@@ -90,17 +100,23 @@ Helpers:
 
 ## x402
 
-Use the facade method for x402 integration in this beta:
+Use the facade method for x402 integration:
 
 ```ts
 import { x402HTTPClient, type x402Client } from '@x402/core/client';
 import { wrapFetchWithPayment } from '@x402/fetch';
 
 declare const client: x402Client;
+declare const merchantPayTo: `0x${string}`;
 
 const handle = divigent.attachTo(client, {
   maxPaymentAmount: parseUsdc('5'),
+  maxSessionPaymentAmount: parseUsdc('25'),
   minIdleThreshold: parseUsdc('0.25'),
+  allowedPayTo: [merchantPayTo],
+  requireAllowedPayTo: true,
+  allowedOrigins: ['https://api.example.com'],
+  allowedResources: ['https://api.example.com/paid'],
 });
 
 const http = new x402HTTPClient(client);
@@ -112,14 +128,13 @@ await fetchWithDivigentYield('https://api.example.com/paid');
 handle.detach();
 ```
 
-For a full Base Sepolia example that starts a local x402 v2 merchant endpoint
-charging Divigent-managed test USDC, then covers setup, deposit, automatic
-x402 recall withdrawals, post-settlement idle deposits, paid fetch, and detach, see
-[`examples/x402-divigent-base-sepolia.ts`](examples/x402-divigent-base-sepolia.ts).
+For full buyer and seller integration examples, use the GitBook integration
+guide.
 
-The fetch wrapper waits until x402 settlement succeeds, then deposits wallet
-USDC above the configured idle buffer back into Divigent. Lower-level x402
-helpers are not part of the public beta API yet.
+The buyer fetch wrapper waits until x402 settlement succeeds, then deposits
+wallet USDC above the configured idle buffer back into Divigent. Seller
+integrations can attach `divigent.attachToResourceServer(resourceServer, config)`
+to sweep merchant income into Divigent after x402 settlement.
 
 If a just-in-time recall cannot make at least the payment amount liquid, the SDK
 aborts before x402 signs a payment authorization and throws a `DivigentError`
@@ -222,7 +237,7 @@ real protocol wiring, deposits, withdrawals, permit deposits, operator flows,
 routing behavior, pause/treasury/oracle lifecycle paths, and x402 recall
 behavior against deployed venue dependencies.
 
-Before publishing a beta release, run:
+Before publishing a release, run:
 
 ```bash
 npm run prepublishOnly

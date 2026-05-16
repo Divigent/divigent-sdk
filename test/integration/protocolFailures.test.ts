@@ -67,6 +67,7 @@ async function withEmergencyDivigent<T>(params: {
 test.sequential(
   'SDK pause keeps deposits blocked while permissionless withdraw remains available',
   async ({ divigent, publicClient, rpcUrl }) => {
+    await withForkSnapshot(rpcUrl, async () => {
     const amount = parseUsdc('10');
 
     await withPreparedAgent({
@@ -108,6 +109,7 @@ test.sequential(
         },
       });
       await expect(divigent.depositsPaused()).resolves.toBe(false);
+    });
     });
   },
 );

@@ -48,6 +48,7 @@ export type MockClientOptions = {
   allowance?: bigint | undefined;
   usdcBalance?: bigint | undefined;
   dvUsdcBalance?: bigint | undefined;
+  isAuthorized?: boolean | undefined;
   simulatedApproveResult?: boolean | undefined;
   simulatedDepositResult?: bigint | undefined;
   simulatedWithdrawResult?: bigint | undefined;
@@ -93,6 +94,7 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
     if (functionName === 'name') return 'USD Coin';
     if (functionName === 'version') return '2';
     if (functionName === 'nonces') return 7n;
+    if (functionName === 'authorizedWallets') return opts.isAuthorized ?? false;
     if (functionName === 'USDC') return addresses.usdc;
     if (functionName === 'DV_USDC') return addresses.dvUsdc;
     if (functionName === 'FEE_COLLECTOR') return addresses.feeCollector;
@@ -114,8 +116,11 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
     if (functionName === 'withdraw') {
       return { request: { ...request, gas: 333n }, result: opts.simulatedWithdrawResult ?? usdc('1.9') };
     }
-    if (functionName === 'setOperator') {
+    if (functionName === 'initialize' || functionName === 'initializeFor') {
       return { request: { ...request, gas: 444n }, result: undefined };
+    }
+    if (functionName === 'setOperator') {
+      return { request: { ...request, gas: 555n }, result: undefined };
     }
     throw new Error(`Unhandled simulateContract function ${String(functionName)}`);
   });

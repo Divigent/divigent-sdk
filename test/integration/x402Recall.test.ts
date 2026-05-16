@@ -66,7 +66,7 @@ test.sequential(
         reserveFloor,
         deficit: paymentAmount + reserveFloor - beforeRecall.liquidUsdc,
         recallShares: expect.any(BigInt),
-        recallTxHash: expect.any(String),
+        recallTxHash: expect.stringMatching(/^0x[a-fA-F0-9]{64}$/),
       }));
     });
   },
