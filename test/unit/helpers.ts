@@ -45,6 +45,7 @@ export type MockClientOptions = {
   previewRedeem?: bigint | undefined;
   previewWithdrawNet?: bigint | undefined;
   recommendedRoute?: 0 | 1 | undefined;
+  minDeposit?: bigint | undefined;
   allowance?: bigint | undefined;
   usdcBalance?: bigint | undefined;
   dvUsdcBalance?: bigint | undefined;
@@ -84,7 +85,7 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
     if (functionName === 'previewRedeem') return opts.previewRedeem ?? usdc('2');
     if (functionName === 'previewWithdrawNet') return opts.previewWithdrawNet ?? 500_000n;
     if (functionName === 'getRecommendedRoute') return opts.recommendedRoute ?? 0;
-    if (functionName === 'MIN_DEPOSIT') return usdc('10');
+    if (functionName === 'MIN_DEPOSIT') return opts.minDeposit ?? 0n;
     if (functionName === 'allowance') return opts.allowance ?? 0n;
     if (functionName === 'balanceOf') {
       const reqAddress = String(request.address).toLowerCase();

@@ -14,6 +14,7 @@ import {
   AddressMismatchError,
   ChainMismatchError,
   DivigentError,
+  MinDepositNotMetError,
   OperatorAckRequiredError,
   PermitUnsupportedFor7702AccountError,
   PermitUnsupportedForTokenError,
@@ -185,7 +186,10 @@ export type SetOperatorParams = {
 export type DepositParams = {
   /** @notice Deposit amount in USDC atomic units. */
   amount: bigint;
-  /** @notice Wallet credited with dvUSDC shares. Defaults to the connected wallet. */
+  /**
+   * @notice Wallet that supplies USDC and receives dvUSDC shares.
+   * Defaults to the connected wallet.
+   */
   wallet?: EvmAddress;
   /** @notice Minimum dvUSDC shares accepted. If omitted, the SDK derives it from preview and slippage. */
   minSharesOut?: bigint;
@@ -219,7 +223,10 @@ export type ApproveUsdcPlan = Prettify<DivigentTransactionPlan<'approveUsdc'> & 
   owner: EvmAddress;
   token: EvmAddress;
   spender: EvmAddress;
+  /** @notice Caller-requested minimum deposit amount. */
   amount: bigint;
+  /** @notice Actual USDC allowance written by the approval transaction. */
+  approvalAmount: bigint;
   simulationResult: boolean;
 }>;
 
@@ -289,6 +296,9 @@ export type EnsureInitializedParams = WaitOptions & {
 // Stablecoin vault PPS drift is normally tiny; 10 bps is a tight default for
 // user-initiated exits. The x402 recall path uses a wider payment-safe margin.
 const DEFAULT_SLIPPAGE_BPS = 10;
+const APPROVAL_VISIBILITY_TIMEOUT_MS = 60_000;
+const APPROVAL_VISIBILITY_POLL_MS = 2_000;
+const MAX_UINT256 = (1n << 256n) - 1n;
 
 function withFeeOverrides(
   request: unknown,
@@ -299,6 +309,64 @@ function withFeeOverrides(
 
 function sameAddress(a: EvmAddress, b: EvmAddress): boolean {
   return getAddress(a) === getAddress(b);
+}
+
+function approvalAmountWithDustBuffer(amount: bigint): bigint {
+  // Keep SDK-managed approvals deposit-safe even if an RPC or token implementation
+  // treats an exact allowance edge inconsistently. One atomic USDC unit is the
+  // smallest possible buffer and avoids the unlimited-approval footgun. Preserve
+  // zero for explicit allowance revokes and max uint256 to avoid overflow.
+  if (amount === 0n || amount === MAX_UINT256) return amount;
+  return amount + 1n;
+}
+
+function errorText(error: unknown): string {
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  let cur: unknown = error;
+  let depth = 0;
+  while (cur && depth < 16 && !seen.has(cur)) {
+    seen.add(cur);
+    if (cur instanceof Error) {
+      parts.push(cur.message);
+      const shortMessage = (cur as { shortMessage?: unknown }).shortMessage;
+      if (typeof shortMessage === 'string') parts.push(shortMessage);
+    } else if (typeof cur === 'string') {
+      parts.push(cur);
+    }
+    cur = (cur as { cause?: unknown }).cause;
+    depth++;
+  }
+  return parts.join('\n').toLowerCase();
+}
+
+function shouldFallbackPermitWriteToApproval(error: unknown): boolean {
+  if (error instanceof DivigentError) {
+    const errorName = error.context?.errorName;
+    if (errorName === 'InsufficientPermitAllowance') return true;
+    const reason = error.context?.reason;
+    if (
+      typeof reason === 'string' &&
+      reason.toLowerCase().includes('transfer amount exceeds allowance')
+    ) {
+      return true;
+    }
+  }
+
+  const text = errorText(error);
+  return (
+    text.includes('transfer amount exceeds allowance') ||
+    text.includes('erc20: insufficient allowance') ||
+    text.includes('erc20insufficientallowance') ||
+    text.includes('erc20 insufficient allowance') ||
+    text.includes('insufficient allowance') ||
+    text.includes('insufficientpermitallowance') ||
+    text.includes('insufficient permit allowance')
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function resolveChain(config: DivigentConfig): DivigentChain {
@@ -325,6 +393,7 @@ export class Divigent {
 
   /** Serializes permit signing per owner so concurrent permits cannot share a nonce. */
   private readonly permitQueues = new Map<string, Promise<unknown>>();
+  private minDepositPromise: Promise<bigint> | undefined;
 
   private constructor(cfg: {
     publicClient: PublicClient;
@@ -435,8 +504,13 @@ export class Divigent {
     const key = owner.toLowerCase();
     const prev = this.permitQueues.get(key) ?? Promise.resolve();
     const next = prev.then(fn, fn);
-    // Keep the stored chain usable after a failed permit attempt.
-    this.permitQueues.set(key, next.then(() => undefined, () => undefined));
+    const cleanup = next.then(() => undefined, () => undefined);
+    this.permitQueues.set(key, cleanup);
+    void cleanup.then(() => {
+      if (this.permitQueues.get(key) === cleanup) {
+        this.permitQueues.delete(key);
+      }
+    });
     return next as Promise<T>;
   }
 
@@ -561,7 +635,16 @@ export class Divigent {
    * @returns Minimum deposit in USDC atomic units.
    */
   minDeposit(): Promise<bigint> {
-    return readRouterMinDeposit(this.publicClient, this.addresses.router);
+    if (this.minDepositPromise === undefined) {
+      const pending = readRouterMinDeposit(this.publicClient, this.addresses.router);
+      this.minDepositPromise = pending;
+      void pending.catch(() => {
+        if (this.minDepositPromise === pending) {
+          this.minDepositPromise = undefined;
+        }
+      });
+    }
+    return this.minDepositPromise;
   }
 
   /**
@@ -849,13 +932,89 @@ export class Divigent {
 
   // Core deposit and withdraw writes
 
-  /**
-   * @notice Approve the Divigent router to spend an exact USDC amount.
-   * @param amount USDC amount in atomic units.
-   * @param fees Optional EIP-1559 fee overrides.
-   * @returns Transaction hash.
-   */
-  approveUsdc(amount: bigint, fees?: FeeOverrides): Promise<TxHash> {
+  private async assertMinDepositAmount(amount: bigint): Promise<void> {
+    const minimum = await this.minDeposit();
+    if (amount < minimum) {
+      throw new MinDepositNotMetError(amount, minimum);
+    }
+  }
+
+  private depositWithResolvedMinShares(
+    params: DepositParams,
+    wallet: EvmAddress,
+    minSharesOut: bigint,
+  ): Promise<TxHash> {
+    return depositWrite({
+      walletClient: this.requireWallet(),
+      publicClient: this.publicClient,
+      router: this.addresses.router,
+      amount: params.amount,
+      wallet,
+      minSharesOut,
+      ...(params.fees && { fees: params.fees }),
+    });
+  }
+
+  private async waitForUsdcApprovalVisible(
+    owner: EvmAddress,
+    amount: bigint,
+  ): Promise<void> {
+    const deadline = Date.now() + APPROVAL_VISIBILITY_TIMEOUT_MS;
+    let allowance = await this.usdcAllowance(owner);
+
+    while (allowance < amount && Date.now() < deadline) {
+      await sleep(APPROVAL_VISIBILITY_POLL_MS);
+      allowance = await this.usdcAllowance(owner);
+    }
+
+    if (allowance < amount) {
+      throw new DivigentError(
+        '[@divigent/sdk] USDC allowance for Divigent router was not visible before timeout',
+        {
+          code: 'DIVIGENT_ALLOWANCE_NOT_READY',
+          category: 'chain',
+          retryable: true,
+          context: {
+            owner,
+            spender: this.addresses.router,
+            allowance,
+            amount,
+          },
+        },
+      );
+    }
+  }
+
+  private async depositViaApproval(
+    params: DepositParams,
+    wallet: EvmAddress,
+    minSharesOut: bigint,
+  ): Promise<TxHash> {
+    const approvalOwner = this.requireSigner().account.address as EvmAddress;
+    if (!sameAddress(approvalOwner, wallet)) {
+      throw new DivigentError(
+        '[@divigent/sdk] approval fallback requires the deposit wallet to match the signer. ' +
+          'Call approveUsdc() + deposit() explicitly when funding a different wallet.',
+        {
+          code: 'DIVIGENT_PERMIT_FALLBACK_OWNER_MISMATCH',
+          category: 'validation',
+          context: { signer: approvalOwner, wallet },
+        },
+      );
+    }
+
+    const targetAllowance = approvalAmountWithDustBuffer(params.amount);
+    const allowance = await this.usdcAllowance(approvalOwner);
+    if (allowance < targetAllowance) {
+      const approveHash = await this.approveUsdcAmount(targetAllowance, params.fees);
+      await this.waitForReceipt(approveHash);
+      await this.waitForUsdcApprovalVisible(approvalOwner, targetAllowance);
+    }
+
+    return this.depositWithResolvedMinShares(params, wallet, minSharesOut);
+  }
+
+  private approveUsdcAmount(amount: bigint, fees?: FeeOverrides): Promise<TxHash> {
     return approveUsdc({
       walletClient: this.requireWallet(),
       publicClient: this.publicClient,
@@ -867,18 +1026,34 @@ export class Divigent {
   }
 
   /**
-   * @notice Build and simulate an exact USDC approval transaction without broadcasting it.
-   * @param amount USDC amount in atomic units.
+   * @notice Approve the Divigent router to spend USDC for a deposit.
+   * @remarks The SDK approves one extra atomic USDC unit when possible so
+   * approve-then-deposit integrations avoid exact-allowance edge cases.
+   * @param amount Minimum USDC deposit amount in atomic units.
+   * @param fees Optional EIP-1559 fee overrides.
+   * @returns Transaction hash.
+   */
+  approveUsdc(amount: bigint, fees?: FeeOverrides): Promise<TxHash> {
+    const approvalAmount = approvalAmountWithDustBuffer(amount);
+    return this.approveUsdcAmount(approvalAmount, fees);
+  }
+
+  /**
+   * @notice Build and simulate a deposit-safe USDC approval transaction without broadcasting it.
+   * @remarks The planned approval uses the same one-atomic-unit buffer as
+   * `approveUsdc`.
+   * @param amount Minimum USDC deposit amount in atomic units.
    * @param fees Optional EIP-1559 fee overrides to include in the planned request.
    * @returns A viem-ready write request and approval metadata.
    */
   async planApproveUsdc(amount: bigint, fees?: FeeOverrides): Promise<ApproveUsdcPlan> {
     const { account, chain } = this.requireSigner();
+    const approvalAmount = approvalAmountWithDustBuffer(amount);
     const { request, result } = await runWrite(() => this.publicClient.simulateContract({
       address: this.addresses.usdc,
       abi: usdcAbi,
       functionName: 'approve',
-      args: [this.addresses.router, amount],
+      args: [this.addresses.router, approvalAmount],
       account,
       chain,
     }), usdcAbi);
@@ -889,6 +1064,7 @@ export class Divigent {
       token: this.addresses.usdc,
       spender: this.addresses.router,
       amount,
+      approvalAmount,
       request: withFeeOverrides(request, fees),
       simulationResult: result,
     };
@@ -910,7 +1086,7 @@ export class Divigent {
     const previewShares = await this.previewDeposit(params.amount);
     const slippageBps = params.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
     const minSharesOut = params.minSharesOut ?? applySlippageDown(previewShares, slippageBps);
-    const allowance = await this.usdcAllowance(owner);
+    const allowance = await this.usdcAllowance(wallet);
     const approvalRequired = allowance >= params.amount ? 0n : params.amount - allowance;
 
     const baseRequest = {
@@ -962,16 +1138,9 @@ export class Divigent {
    */
   async deposit(params: DepositParams): Promise<TxHash> {
     const wallet = params.wallet ?? this.defaultWallet();
+    await this.assertMinDepositAmount(params.amount);
     const minSharesOut = await this.resolveMinSharesOut(params);
-    return depositWrite({
-      walletClient: this.requireWallet(),
-      publicClient: this.publicClient,
-      router: this.addresses.router,
-      amount: params.amount,
-      wallet,
-      minSharesOut,
-      ...(params.fees && { fees: params.fees }),
-    });
+    return this.depositWithResolvedMinShares(params, wallet, minSharesOut);
   }
 
   private async resolveMinSharesOut(params: DepositParams): Promise<bigint> {
@@ -1003,6 +1172,7 @@ export class Divigent {
   async depositWithPermit(params: DepositWithPermitParams): Promise<TxHash> {
     const wallet = params.wallet ?? this.defaultWallet();
     const fallback = params.fallbackOnPermitUnsupported ?? params.fallbackOn7702 ?? true;
+    await this.assertMinDepositAmount(params.amount);
     const minSharesOut = await this.resolveMinSharesOut(params);
 
     return this.queuePermit(wallet, async () => {
@@ -1032,43 +1202,28 @@ export class Divigent {
           err instanceof PermitUnsupportedForTokenError
         );
         if (fallback && permitUnsupported) {
-          const approvalOwner = this.requireSigner().account.address as EvmAddress;
-          if (!sameAddress(approvalOwner, wallet)) {
-            throw new DivigentError(
-              '[@divigent/sdk] permit fallback requires the deposit wallet to match the signer. ' +
-                'Call approveUsdc() + deposit() explicitly when funding a different wallet.',
-              {
-                code: 'DIVIGENT_PERMIT_FALLBACK_OWNER_MISMATCH',
-                category: 'validation',
-                context: { signer: approvalOwner, wallet },
-              },
-            );
-          }
-          const allowance = await this.usdcAllowance(approvalOwner);
-          if (allowance < params.amount) {
-            const approveHash = await this.approveUsdc(params.amount, params.fees);
-            await this.waitForReceipt(approveHash);
-          }
-          return this.deposit({
-            amount: params.amount,
-            wallet,
-            minSharesOut,
-            ...(params.fees && { fees: params.fees }),
-          });
+          return this.depositViaApproval(params, wallet, minSharesOut);
         }
         throw err;
       }
 
-      return depositWithPermitWrite({
-        walletClient: this.requireWallet(),
-        publicClient: this.publicClient,
-        router: this.addresses.router,
-        amount: params.amount,
-        wallet,
-        permit,
-        minSharesOut,
-        ...(params.fees && { fees: params.fees }),
-      });
+      try {
+        return await depositWithPermitWrite({
+          walletClient: this.requireWallet(),
+          publicClient: this.publicClient,
+          router: this.addresses.router,
+          amount: params.amount,
+          wallet,
+          permit,
+          minSharesOut,
+          ...(params.fees && { fees: params.fees }),
+        });
+      } catch (err) {
+        if (fallback && shouldFallbackPermitWriteToApproval(err)) {
+          return this.depositViaApproval(params, wallet, minSharesOut);
+        }
+        throw err;
+      }
     });
   }
 

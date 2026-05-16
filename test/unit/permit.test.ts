@@ -389,35 +389,43 @@ describe('depositWithPermit behavior', () => {
   });
   // Exercises: falls back to approve, wait, then deposit for 7702/smart-account owners.
   it('falls back to approve, wait, then deposit for 7702/smart-account owners', async () => {
-    const allowances = [0n, usdc('0.001')];
+    const amount = usdc('0.001');
+    const allowances = [0n, amount + 1n];
     const { divigent, simulateContract, writeContract, waitForTransactionReceipt } =
       createDivigentWithClients({
         getCode: '0x1234',
         previewDeposit: 1_000_000n,
         writeHashes: [HASH_1, HASH_2],
         readContract: (request) => {
+          if (request.functionName === 'MIN_DEPOSIT') return 0n;
           if (request.functionName === 'previewDeposit') return 1_000_000n;
           if (request.functionName === 'allowance') return allowances.shift() ?? usdc('0.001');
           throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
         },
       });
 
-    await expect(divigent.depositWithPermit({ amount: usdc('0.001') })).resolves.toBe(HASH_2);
+    await expect(divigent.depositWithPermit({ amount })).resolves.toBe(HASH_2);
 
     expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual([
       'approve',
       'deposit',
     ]);
+    expect(simulateContract.mock.calls[0]?.[0]).toMatchObject({
+      functionName: 'approve',
+      args: [addresses.router, amount + 1n],
+    });
     expect(waitForTransactionReceipt).toHaveBeenCalledWith({ hash: HASH_1 });
     expect(writeContract).toHaveBeenCalledTimes(2);
   });
   // Exercises: falls back when a permit-like USDC token lacks permit metadata.
   it('falls back to approve, wait, then deposit when permit metadata reads revert', async () => {
-    const allowances = [0n, usdc('0.001')];
+    const amount = usdc('0.001');
+    const allowances = [0n, amount + 1n];
     const { divigent, simulateContract, signTypedData, writeContract, waitForTransactionReceipt } =
       createDivigentWithClients({
         writeHashes: [HASH_1, HASH_2],
         readContract: (request) => {
+          if (request.functionName === 'MIN_DEPOSIT') return 0n;
           if (request.functionName === 'name') return 'USD Coin';
           if (request.functionName === 'version') throw new Error('version reverted');
           if (request.functionName === 'nonces') return 0n;
@@ -427,7 +435,7 @@ describe('depositWithPermit behavior', () => {
         },
       });
 
-    await expect(divigent.depositWithPermit({ amount: usdc('0.001') })).resolves.toBe(HASH_2);
+    await expect(divigent.depositWithPermit({ amount })).resolves.toBe(HASH_2);
 
     expect(signTypedData).not.toHaveBeenCalled();
     expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual([
@@ -439,15 +447,16 @@ describe('depositWithPermit behavior', () => {
   });
   // Exercises: skips the approval transaction when fallback allowance already covers the deposit.
   it('skips fallback approval when existing allowance is sufficient', async () => {
+    const amount = usdc('0.001');
     const { divigent, simulateContract, writeContract, waitForTransactionReceipt } =
       createDivigentWithClients({
         getCode: '0x1234',
         previewDeposit: 1_000_000n,
-        allowance: usdc('0.001'),
+        allowance: amount + 1n,
         writeHashes: [HASH_1],
       });
 
-    await expect(divigent.depositWithPermit({ amount: usdc('0.001') })).resolves.toBe(HASH_1);
+    await expect(divigent.depositWithPermit({ amount })).resolves.toBe(HASH_1);
 
     expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual(['deposit']);
     expect(waitForTransactionReceipt).not.toHaveBeenCalled();
@@ -475,6 +484,7 @@ describe('depositWithPermit behavior', () => {
   it('does not fall back from unsupported token permit metadata when disabled', async () => {
     const { divigent, writeContract } = createDivigentWithClients({
       readContract: (request) => {
+        if (request.functionName === 'MIN_DEPOSIT') return 0n;
         if (request.functionName === 'previewDeposit') return 1_000_000n;
         if (request.functionName === 'name') return 'USD Coin';
         if (request.functionName === 'version') throw new Error('method unavailable');
@@ -497,6 +507,138 @@ describe('depositWithPermit behavior', () => {
     await expect(
       divigent.depositWithPermit({ amount: usdc('0.001'), wallet: SECOND_OWNER }),
     ).rejects.toMatchObject({ code: 'DIVIGENT_PERMIT_FALLBACK_OWNER_MISMATCH' });
+    expect(writeContract).not.toHaveBeenCalled();
+  });
+  // Exercises: falls back when a permit signature is accepted locally but router simulation
+  // reports that the permit allowance did not materialize on-chain.
+  it('falls back to approval deposit when permit execution reports insufficient allowance', async () => {
+    const amount = usdc('0.001');
+    const allowances = [0n, amount + 1n];
+    const data = encodeErrorResult({
+      abi: routerAbi,
+      errorName: 'InsufficientPermitAllowance',
+      args: [0n, amount],
+    });
+    const { divigent, simulateContract, signTypedData, writeContract, waitForTransactionReceipt } =
+      createDivigentWithClients({
+        signTypedData: () => lowSSignature(),
+        writeHashes: [HASH_1, HASH_2],
+        readContract: (request) => {
+          if (request.functionName === 'previewDeposit') return 1_000_000n;
+          if (request.functionName === 'MIN_DEPOSIT') return 0n;
+          if (request.functionName === 'name') return 'USD Coin';
+          if (request.functionName === 'version') return '2';
+          if (request.functionName === 'nonces') return 7n;
+          if (request.functionName === 'allowance') return allowances.shift() ?? amount + 1n;
+          throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+        },
+        simulateContract: (request) => {
+          if (request.functionName === 'depositWithPermit') {
+            throw new ContractFunctionRevertedError({
+              abi: routerAbi,
+              data,
+              functionName: 'depositWithPermit',
+            });
+          }
+          if (request.functionName === 'approve') {
+            return { request: { ...request, gas: 111n }, result: true };
+          }
+          if (request.functionName === 'deposit') {
+            return { request: { ...request, gas: 222n }, result: 900_000n };
+          }
+          throw new Error(`Unhandled simulateContract function ${String(request.functionName)}`);
+        },
+      });
+
+    await expect(divigent.depositWithPermit({ amount })).resolves.toBe(HASH_2);
+
+    expect(signTypedData).toHaveBeenCalledTimes(1);
+    expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual([
+      'depositWithPermit',
+      'approve',
+      'deposit',
+    ]);
+    expect(simulateContract.mock.calls[1]?.[0]).toMatchObject({
+      functionName: 'approve',
+      args: [addresses.router, amount + 1n],
+    });
+    expect(waitForTransactionReceipt).toHaveBeenCalledWith({ hash: HASH_1 });
+    expect(writeContract).toHaveBeenCalledTimes(2);
+  });
+  // Exercises: supports common ERC20 allowance revert text variants from non-Divigent tokens.
+  it.each([
+    'ERC20: insufficient allowance',
+    'ERC20InsufficientAllowance(address,uint256,uint256)',
+  ])('falls back to approval deposit when permit execution reports %s', async (message) => {
+    const amount = usdc('0.001');
+    const allowances = [0n, amount + 1n];
+    const { divigent, simulateContract, writeContract } = createDivigentWithClients({
+      signTypedData: () => lowSSignature(),
+      writeHashes: [HASH_1, HASH_2],
+      readContract: (request) => {
+        if (request.functionName === 'previewDeposit') return 1_000_000n;
+        if (request.functionName === 'MIN_DEPOSIT') return 0n;
+        if (request.functionName === 'name') return 'USD Coin';
+        if (request.functionName === 'version') return '2';
+        if (request.functionName === 'nonces') return 7n;
+        if (request.functionName === 'allowance') return allowances.shift() ?? amount + 1n;
+        throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+      },
+      simulateContract: (request) => {
+        if (request.functionName === 'depositWithPermit') throw new Error(message);
+        if (request.functionName === 'approve') {
+          return { request: { ...request, gas: 111n }, result: true };
+        }
+        if (request.functionName === 'deposit') {
+          return { request: { ...request, gas: 222n }, result: 900_000n };
+        }
+        throw new Error(`Unhandled simulateContract function ${String(request.functionName)}`);
+      },
+    });
+
+    await expect(divigent.depositWithPermit({ amount })).resolves.toBe(HASH_2);
+    expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual([
+      'depositWithPermit',
+      'approve',
+      'deposit',
+    ]);
+    expect(writeContract).toHaveBeenCalledTimes(2);
+  });
+  // Exercises: unrelated router reverts propagate instead of being hidden by approval fallback.
+  it('does not fall back to approval deposit for unrelated permit execution reverts', async () => {
+    const amount = usdc('0.001');
+    const data = encodeErrorResult({
+      abi: routerAbi,
+      errorName: 'InvalidAmount',
+    });
+    const { divigent, simulateContract, writeContract } = createDivigentWithClients({
+      signTypedData: () => lowSSignature(),
+      readContract: (request) => {
+        if (request.functionName === 'previewDeposit') return 1_000_000n;
+        if (request.functionName === 'MIN_DEPOSIT') return 0n;
+        if (request.functionName === 'name') return 'USD Coin';
+        if (request.functionName === 'version') return '2';
+        if (request.functionName === 'nonces') return 7n;
+        throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+      },
+      simulateContract: (request) => {
+        if (request.functionName === 'depositWithPermit') {
+          throw new ContractFunctionRevertedError({
+            abi: routerAbi,
+            data,
+            functionName: 'depositWithPermit',
+          });
+        }
+        throw new Error(`Unhandled simulateContract function ${String(request.functionName)}`);
+      },
+    });
+
+    await expect(divigent.depositWithPermit({ amount })).rejects.toMatchObject({
+      errorName: 'InvalidAmount',
+    });
+    expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual([
+      'depositWithPermit',
+    ]);
     expect(writeContract).not.toHaveBeenCalled();
   });
   // Exercises: surfaces PermitExpired from router permit-deposit simulation.
@@ -552,6 +694,7 @@ describe('depositWithPermit behavior', () => {
     await expect(divigent.depositWithPermit({
       amount,
       deadline: 2_000n,
+      fallbackOnPermitUnsupported: false,
     })).rejects.toMatchObject({
       errorName: 'InsufficientPermitAllowance',
       args: [0n, amount],

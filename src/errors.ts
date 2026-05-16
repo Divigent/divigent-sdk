@@ -74,6 +74,15 @@ function withDefaults(
   return next;
 }
 
+function formatUsdcForError(value: bigint): string {
+  const sign = value < 0n ? '-' : '';
+  const abs = value < 0n ? -value : value;
+  const whole = abs / 1_000_000n;
+  const fraction = (abs % 1_000_000n).toString().padStart(6, '0');
+  const trimmed = fraction.replace(/0+$/, '');
+  return `${sign}${whole}${trimmed ? `.${trimmed}` : ''} USDC`;
+}
+
 /**
  * @notice Base class for every typed error thrown by the Divigent SDK.
  */
@@ -208,6 +217,30 @@ export class PaymentCapExceededError extends DivigentError {
       ),
     );
     this.name = 'PaymentCapExceededError';
+  }
+}
+
+/**
+ * @notice Deposit amount is below the router's on-chain minimum.
+ */
+export class MinDepositNotMetError extends DivigentError {
+  constructor(
+    public readonly amount: bigint,
+    public readonly minDeposit: bigint,
+    options?: DivigentErrorOptions,
+  ) {
+    super(
+      `Deposit amount ${formatUsdcForError(amount)} is below router MIN_DEPOSIT=${formatUsdcForError(minDeposit)}`,
+      withDefaults(
+        {
+          code: 'DIVIGENT_MIN_DEPOSIT_NOT_MET',
+          category: 'validation',
+          context: { amount, minDeposit },
+        },
+        options,
+      ),
+    );
+    this.name = 'MinDepositNotMetError';
   }
 }
 

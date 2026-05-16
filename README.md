@@ -39,6 +39,8 @@ console.log(formatUsdc(position.currentValue));
 
 // Warning: these broadcast real Base mainnet transactions.
 const amount = parseUsdc('1');
+// approveUsdc writes a deposit-safe allowance (amount plus one atomic USDC unit)
+// so approve-then-deposit flows avoid exact-allowance edge cases.
 await divigent.approveUsdc(amount);
 const txHash = await divigent.deposit({ amount });
 console.log(txHash);
@@ -79,11 +81,11 @@ Common read methods:
 
 Common write methods:
 
-- `planApproveUsdc(amount)`
+- `planApproveUsdc(amount)` (plans a deposit-safe approval amount)
 - `planDeposit(params)`
 - `planWithdraw(params)`
 - `sendPlan(plan)`
-- `approveUsdc(amount)`
+- `approveUsdc(amount)` (approves a deposit-safe allowance)
 - `deposit(params)`
 - `depositAndWait(params)`
 - `withdraw(params)`

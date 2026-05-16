@@ -300,6 +300,64 @@ describe('handleDivigentSettlement', () => {
     }));
   });
 
+  // Exercises: refuses to verify settlement receipts from a client bound to the wrong chain.
+  it('skips idle deposit when settlement receipt client is on the wrong chain', async () => {
+    const getTransactionReceipt = vi.fn();
+    const divigent = createIncomeDivigent({ balances: [usdc('12')] });
+    Object.assign(divigent, {
+      publicClient: {
+        chain: { id: 1 },
+        getTransactionReceipt,
+      },
+    });
+    const onNonFatalError = vi.fn();
+
+    await expect(
+      handleDivigentSettlement(
+        settledResponse(),
+        settlementHttp({ success: true, transaction: HASH_1 }) as never,
+        divigent,
+        new ReserveFloor({ minIdleThreshold: usdc('0.25') }),
+        { minDeposit: usdc('10'), onNonFatalError },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(getTransactionReceipt).not.toHaveBeenCalled();
+    expect(divigent.depositWithPermitAndWait).not.toHaveBeenCalled();
+    expect(onNonFatalError.mock.calls[0]?.[0].error).toMatchObject({
+      code: 'DIVIGENT_X402_SETTLEMENT_CHAIN_MISMATCH',
+    });
+  });
+
+  // Exercises: refuses to use settlement receipts from reverted transactions.
+  it('skips idle deposit when settlement transaction receipt is not successful', async () => {
+    const divigent = createIncomeDivigent({ balances: [usdc('12')] });
+    Object.assign(divigent, {
+      publicClient: {
+        getTransactionReceipt: vi.fn(async () => ({
+          status: 'reverted',
+          logs: [],
+        })),
+      },
+    });
+    const onNonFatalError = vi.fn();
+
+    await expect(
+      handleDivigentSettlement(
+        settledResponse(),
+        settlementHttp({ success: true, transaction: HASH_1 }) as never,
+        divigent,
+        new ReserveFloor({ minIdleThreshold: usdc('0.25') }),
+        { minDeposit: usdc('10'), onNonFatalError },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(divigent.depositWithPermitAndWait).not.toHaveBeenCalled();
+    expect(onNonFatalError.mock.calls[0]?.[0].error).toMatchObject({
+      code: 'DIVIGENT_X402_SETTLEMENT_TX_REVERTED',
+    });
+  });
+
   // Exercises: derives settlement debit reserve from the EVM receipt when x402 omits amount.
   it('derives settlement debit reserve from settlement transfer logs', async () => {
     const transfer = transferLog(OWNER, SELLER, usdc('0.2'));

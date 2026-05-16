@@ -113,6 +113,7 @@ export {
   AlreadyAttachedError,
   ChainMismatchError,
   DivigentError,
+  MinDepositNotMetError,
   OperatorAckRequiredError,
   PanicError,
   PaymentCapExceededError,

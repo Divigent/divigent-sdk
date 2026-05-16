@@ -8,6 +8,7 @@ import {
   ChainMismatchError,
   ContractRevertError,
   DivigentError,
+  MinDepositNotMetError,
   OperatorAckRequiredError,
   ZeroAddressError,
 } from '../../src/errors';
@@ -245,6 +246,29 @@ describe('operator acknowledgement guard', () => {
 });
 
 describe('deposit and withdraw min-output derivation', () => {
+  // Exercises: rejects deposits below the router minimum before previewing or broadcasting.
+  it('throws a typed error when deposit amount is below MIN_DEPOSIT', async () => {
+    const { divigent, readContract, simulateContract, writeContract } = createDivigentWithClients({
+      minDeposit: usdc('10'),
+    });
+
+    await expect(divigent.deposit({ amount: usdc('9.999999') }))
+      .rejects.toBeInstanceOf(MinDepositNotMetError);
+    await expect(divigent.depositWithPermit({ amount: usdc('9.999999') }))
+      .rejects.toMatchObject({
+        code: 'DIVIGENT_MIN_DEPOSIT_NOT_MET',
+        context: {
+          amount: usdc('9.999999'),
+          minDeposit: usdc('10'),
+        },
+      });
+
+    expect(readContract).not.toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'previewDeposit',
+    }));
+    expect(simulateContract).not.toHaveBeenCalled();
+    expect(writeContract).not.toHaveBeenCalled();
+  });
   // Exercises: uses explicit minSharesOut without previewing deposit.
   it('uses explicit minSharesOut without previewing deposit', async () => {
     const { divigent, readContract, simulateContract } = createDivigentWithClients();
@@ -393,11 +417,42 @@ describe('deposit and withdraw min-output derivation', () => {
 });
 
 describe('transaction planning', () => {
+  // Exercises: public approval helper uses the same deposit-safe buffer as internal fallbacks.
+  it('approves a deposit-safe allowance amount', async () => {
+    const amount = usdc('0.001');
+    const { divigent, simulateContract } = createDivigentWithClients({
+      writeHashes: [HASH_1],
+    });
+
+    await expect(divigent.approveUsdc(amount)).resolves.toBe(HASH_1);
+
+    expect(simulateContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'approve',
+      args: [addresses.router, amount + 1n],
+    }));
+  });
+  // Exercises: approval buffering preserves exact values for revokes and max approvals.
+  it.each([
+    ['zero revokes', 0n],
+    ['max uint256 approvals', (1n << 256n) - 1n],
+  ])('does not buffer %s', async (_label, approvalAmount) => {
+    const { divigent, simulateContract } = createDivigentWithClients({
+      writeHashes: [HASH_1],
+    });
+
+    await expect(divigent.approveUsdc(approvalAmount)).resolves.toBe(HASH_1);
+
+    expect(simulateContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'approve',
+      args: [addresses.router, approvalAmount],
+    }));
+  });
   // Exercises: plans an approval with owner, token, spender, simulation result, and fee overrides.
   it('plans an approval with owner, token, spender, simulation result, and fee overrides', async () => {
+    const amount = usdc('0.001');
     const { divigent } = createDivigentWithClients();
 
-    const plan = await divigent.planApproveUsdc(usdc('0.001'), {
+    const plan = await divigent.planApproveUsdc(amount, {
       maxFeePerGas: 10n,
       maxPriorityFeePerGas: 2n,
     });
@@ -407,13 +462,14 @@ describe('transaction planning', () => {
       owner: OWNER,
       token: addresses.usdc,
       spender: addresses.router,
-      amount: usdc('0.001'),
+      amount,
+      approvalAmount: amount + 1n,
       simulationResult: true,
     });
     expect(plan.request).toMatchObject({
       address: addresses.usdc,
       functionName: 'approve',
-      args: [addresses.router, usdc('0.001')],
+      args: [addresses.router, amount + 1n],
       account: { address: OWNER, type: 'json-rpc' },
       chain: expect.objectContaining({ id: baseSepolia.id }),
       maxFeePerGas: 10n,
@@ -450,6 +506,34 @@ describe('transaction planning', () => {
       args: [usdc('0.001'), OWNER, applySlippageDown(1_000_000n, 10)],
     });
     expect(simulateContract).not.toHaveBeenCalled();
+  });
+  // Exercises: deposit plans check allowance from the wallet that funds the deposit,
+  // not from an operator or relayer submitting the transaction.
+  it('plans deposit approval requirement from the funding wallet override', async () => {
+    const amount = usdc('0.001');
+    const { divigent, readContract } = createDivigentWithClients({
+      previewDeposit: 1_000_000n,
+      readContract: (request) => {
+        if (request.functionName === 'previewDeposit') return 1_000_000n;
+        if (request.functionName === 'allowance') {
+          expect(request.args).toEqual([SECOND_OWNER, addresses.router]);
+          return amount - 10n;
+        }
+        throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+      },
+    });
+
+    const plan = await divigent.planDeposit({ amount, wallet: SECOND_OWNER });
+
+    expect(plan.owner).toBe(OWNER);
+    expect(plan.wallet).toBe(SECOND_OWNER);
+    expect(plan.allowance).toBe(amount - 10n);
+    expect(plan.approvalRequired).toBe(10n);
+    expect(plan.simulated).toBe(false);
+    expect(readContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'allowance',
+      args: [SECOND_OWNER, addresses.router],
+    }));
   });
   // Exercises: handles allowance boundaries without off-by-one approval mistakes.
   it('handles allowance boundaries without off-by-one approval mistakes', async () => {
