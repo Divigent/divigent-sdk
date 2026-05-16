@@ -7,3 +7,6 @@ dist
 .claude
 examples/
 gitbook/
+.env
+.env.*
+!.env.example
