@@ -208,10 +208,10 @@ describe('capital safety invariants', () => {
         expect(divigent.depositWithPermitAndWait).not.toHaveBeenCalled();
       } else {
         expect(txHash).toBe(HASH_1);
-        expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
+        expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith(expect.objectContaining({
           amount: idle,
           wallet: OWNER,
-        });
+        }));
       }
     }
   });

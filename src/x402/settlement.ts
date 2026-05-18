@@ -2,33 +2,19 @@ import type { x402HTTPClient } from '@x402/core/client';
 import type { x402ResourceServer } from '@x402/core/server';
 import { parseEventLogs } from 'viem';
 import { usdcAbi } from '../abis';
+import { CHAINS } from '../core/chains';
 import type { Divigent } from '../divigent';
+import { DivigentError } from '../errors';
 import type { EvmAddress, TxHash } from '../types';
 import type { IdleDepositContext, X402WrapConfig } from './types';
 import {
+  DEFAULT_MAX_PAYMENT_AMOUNT,
+  effectivePaymentCap,
   reportNonFatal,
   ReserveFloor,
   shouldHandleResourceByPolicy,
 } from './attach';
-
-const ownerLocks = new Map<string, Promise<unknown>>();
-
-function withOwnerLock<T>(owner: EvmAddress, fn: () => Promise<T>): Promise<T> {
-  const key = owner.toLowerCase();
-  const prev = ownerLocks.get(key) ?? Promise.resolve();
-  const next = prev.then(fn, fn);
-  const cleanup = next.then(
-    () => undefined,
-    () => undefined,
-  );
-  ownerLocks.set(key, cleanup);
-  void cleanup.then(() => {
-    if (ownerLocks.get(key) === cleanup) {
-      ownerLocks.delete(key);
-    }
-  });
-  return next as Promise<T>;
-}
+import { withOwnerLock } from './locks';
 
 async function resolveMinDeposit(
   minDeposit: DepositIdleOptions['minDeposit'] | undefined,
@@ -54,43 +40,94 @@ function parseSettleAmount(value: unknown): bigint | undefined {
   }
 }
 
+function isTxHash(value: string): value is TxHash {
+  return /^0x[a-fA-F0-9]{64}$/.test(value);
+}
+
 async function settlementDebitReserve(
   divigent: Divigent,
   settle: { payer?: string; amount?: string; transaction?: string },
+  options: Pick<HandleSettlementOptions, 'config' | 'resource'> = {},
 ): Promise<bigint> {
   const wallet = walletAddress(divigent);
   if (!wallet) return 0n;
 
+  const paymentCap = effectivePaymentCap(
+    options.config ?? {},
+    DEFAULT_MAX_PAYMENT_AMOUNT,
+    options.resource,
+  );
   const responseAmount = parseSettleAmount(settle.amount);
-  if (responseAmount !== undefined && sameAddress(settle.payer, wallet)) {
-    return responseAmount;
-  }
+  const responseReserve = responseAmount !== undefined && sameAddress(settle.payer, wallet)
+    ? minBigint(responseAmount, paymentCap)
+    : 0n;
 
   const publicClient = divigent.publicClient as
-    | { getTransactionReceipt?: (args: { hash: TxHash }) => Promise<{ logs: readonly unknown[] }> }
+    | { chain?: { id?: number }; getTransactionReceipt?: (args: { hash: TxHash }) => Promise<{
+      status?: string;
+      logs: readonly unknown[];
+    }> }
     | undefined;
   if (typeof settle.transaction !== 'string' || typeof publicClient?.getTransactionReceipt !== 'function') {
-    return 0n;
+    return responseReserve;
+  }
+  if (publicClient.chain?.id !== undefined && publicClient.chain.id !== CHAINS[divigent.chain].id) {
+    throw new DivigentError('[@divigent/sdk] x402 settlement receipt client is on the wrong chain', {
+      code: 'DIVIGENT_X402_SETTLEMENT_CHAIN_MISMATCH',
+      category: 'chain',
+      context: {
+        expectedChainId: CHAINS[divigent.chain].id,
+        actualChainId: publicClient.chain.id,
+        transaction: settle.transaction,
+      },
+    });
   }
 
   try {
     const receipt = await publicClient.getTransactionReceipt({
       hash: settle.transaction as TxHash,
     });
+    if (receipt.status !== undefined && receipt.status !== 'success') {
+      throw new DivigentError('[@divigent/sdk] x402 settlement transaction did not succeed', {
+        code: 'DIVIGENT_X402_SETTLEMENT_TX_REVERTED',
+        category: 'x402',
+        context: { transaction: settle.transaction, status: receipt.status },
+      });
+    }
+
+    const allowedPayTo = new Set((options.config?.allowedPayTo ?? []).map((addr) => addr.toLowerCase()));
+    if (allowedPayTo.size === 0) return responseReserve;
     const transfers = parseEventLogs({
       abi: usdcAbi,
       logs: receipt.logs as Parameters<typeof parseEventLogs>[0]['logs'],
       eventName: 'Transfer',
     });
 
-    return transfers.reduce((sum, event) => {
+    const receiptReserve = transfers.reduce((sum, event) => {
       if (event.address.toLowerCase() !== divigent.addresses.usdc.toLowerCase()) return sum;
       if (event.args.from.toLowerCase() !== wallet.toLowerCase()) return sum;
+      if (allowedPayTo.size > 0 && !allowedPayTo.has(event.args.to.toLowerCase())) return sum;
       return sum + event.args.value;
     }, 0n);
-  } catch {
-    return 0n;
+    return minBigint(receiptReserve, paymentCap);
+  } catch (err) {
+    if (err instanceof DivigentError) throw err;
+    throw new DivigentError('[@divigent/sdk] unable to verify x402 settlement transaction receipt', {
+      cause: err,
+      code: 'DIVIGENT_X402_SETTLEMENT_RECEIPT_UNAVAILABLE',
+      category: 'x402',
+      retryable: true,
+      context: { transaction: settle.transaction },
+    });
   }
+}
+
+function minBigint(a: bigint, b: bigint): bigint {
+  return a < b ? a : b;
+}
+
+function settlementDedupeKey(divigent: Divigent, transaction: string): string {
+  return `${CHAINS[divigent.chain].id}:${transaction.toLowerCase()}`;
 }
 
 export type DepositIdleOptions = {
@@ -141,7 +178,11 @@ export async function depositIdleAboveFloor(
     const min = await resolveMinDeposit(options.minDeposit);
     if (idle < min) return undefined;
 
-    const result = await divigent.depositWithPermitAndWait({ amount: idle, wallet });
+    const result = await divigent.depositWithPermitAndWait({
+      amount: idle,
+      wallet,
+      fallbackOnPermitUnsupported: true,
+    });
     const txHash = result.txHash;
     if (options.dedupeKey) options.seenTxHashes?.add(options.dedupeKey);
     if (options.onIdleDeposit) {
@@ -207,18 +248,31 @@ export async function handleDivigentSettlement(
   }
 
   if (!settle.success) return undefined;
-  if (typeof settle.transaction !== 'string' || settle.transaction.length === 0) {
+  if (typeof settle.transaction !== 'string' || !isTxHash(settle.transaction)) {
     return undefined;
   }
   const resource = options.resource ?? (response.url || undefined);
   if (!shouldHandleResourceByPolicy(options.config, resource)) return undefined;
 
-  const opts: DepositIdleOptions = { dedupeKey: settle.transaction };
+  const opts: DepositIdleOptions = { dedupeKey: settlementDedupeKey(divigent, settle.transaction) };
   if (options.seenTxHashes !== undefined) opts.seenTxHashes = options.seenTxHashes;
   if (options.minDeposit !== undefined) opts.minDeposit = options.minDeposit;
   if (options.onIdleDeposit !== undefined) opts.onIdleDeposit = options.onIdleDeposit;
   if (options.onNonFatalError !== undefined) opts.onNonFatalError = options.onNonFatalError;
-  const settlementReserve = await settlementDebitReserve(divigent, settle);
+  let settlementReserve = 0n;
+  try {
+    const reserveOptions: Pick<HandleSettlementOptions, 'config' | 'resource'> = {};
+    if (options.config !== undefined) reserveOptions.config = options.config;
+    if (resource !== undefined) reserveOptions.resource = resource;
+    settlementReserve = await settlementDebitReserve(divigent, settle, reserveOptions);
+  } catch (err) {
+    await reportNonFatal(options.onNonFatalError ?? options.config?.onNonFatalError, {
+      phase: 'settlement',
+      error: err,
+      recoverable: true,
+    });
+    return undefined;
+  }
   if (settlementReserve > 0n) opts.extraReserve = settlementReserve;
   return depositIdleAboveFloor(divigent, reserveFloor, opts);
 }
@@ -277,7 +331,7 @@ export function wrapFetchWithDivigentYield(
     settlementOptions.onNonFatalError = options.onNonFatalError ?? options.config?.onNonFatalError;
     const settlement = handleDivigentSettlement(res.clone(), http, divigent, reserveFloor, settlementOptions)
       .catch((err) => {
-        void reportNonFatal(options.config?.onNonFatalError, {
+        void reportNonFatal(settlementOptions.onNonFatalError, {
           phase: 'settlement',
           error: err,
           recoverable: true,
@@ -294,10 +348,14 @@ export function wrapFetchWithDivigentYield(
 }
 
 export type AttachIncomeOptions = {
+  /** @notice Override which wallet to sweep. Defaults to `divigent.walletClient.account.address`. */
+  wallet?: EvmAddress;
   /** @notice Capacity for the per-attach dedupe set. Default: 256. */
   dedupeCapacity?: number;
   /** @notice Skip deposits below this idle amount. Default: 1n. */
-  minDeposit?: bigint;
+  minDeposit?: DepositIdleOptions['minDeposit'];
+  /** @notice Receives successful income-deposit telemetry. */
+  onIdleDeposit?: DepositIdleOptions['onIdleDeposit'];
   /** @notice Receives non-fatal income redeposit errors. Exceptions are swallowed. */
   onNonFatalError?: X402WrapConfig['onNonFatalError'];
 };
@@ -323,12 +381,16 @@ export function attachDivigentIncome(
   server.onAfterSettle(async (ctx) => {
     if (detached) return;
     if (!ctx.result.success) return;
+    if (typeof ctx.result.transaction !== 'string' || !isTxHash(ctx.result.transaction)) return;
 
     const opts: DepositIdleOptions = {
-      dedupeKey: ctx.result.transaction,
+      dedupeKey: settlementDedupeKey(divigent, ctx.result.transaction),
       seenTxHashes,
     };
+    if (options.wallet !== undefined) opts.wallet = options.wallet;
     if (options.minDeposit !== undefined) opts.minDeposit = options.minDeposit;
+    if (options.onIdleDeposit !== undefined) opts.onIdleDeposit = options.onIdleDeposit;
+    if (options.onNonFatalError !== undefined) opts.onNonFatalError = options.onNonFatalError;
     try {
       await depositIdleAboveFloor(divigent, reserveFloor, opts);
     } catch (err) {

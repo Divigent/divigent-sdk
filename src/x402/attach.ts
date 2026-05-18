@@ -17,6 +17,7 @@ import {
 } from '../errors';
 import type { EvmAddress, TxHash } from '../types';
 import { bigintMax } from '../core/utils';
+import { withOwnerLock } from './locks';
 import type {
   FailureContext,
   IntegrationErrorContext,
@@ -28,7 +29,7 @@ import type {
   X402WrapConfig,
 } from './types';
 
-const DEFAULT_MAX_PAYMENT_AMOUNT = 100n * 10n ** 6n; // 100 USDC
+export const DEFAULT_MAX_PAYMENT_AMOUNT = 100n * 10n ** 6n; // 100 USDC
 const RECALL_BALANCE_TIMEOUT_MS = 60_000;
 const RECALL_BALANCE_POLL_MS = 2_000;
 
@@ -131,23 +132,14 @@ export function attachX402HooksWithReserveFloor(
   const expectedNetwork = `eip155:${CHAINS[divigent.chain].id}`;
   const expectedAsset = divigent.addresses.usdc.toLowerCase();
 
-  let lock: Promise<void> = Promise.resolve();
   let detached = false;
+  let sessionPaymentTotal = 0n;
   const redact = config.redact ?? false;
 
   const redactAddr = (a: EvmAddress): EvmAddress | string =>
     redact ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
   const redactHash = (h: TxHash | undefined): TxHash | undefined =>
     redact ? undefined : h;
-
-  const runExclusive = <T>(fn: () => Promise<T>): Promise<T> => {
-    const next = lock.then(fn, fn);
-    lock = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
-  };
 
   type RecallState = {
     owner: EvmAddress;
@@ -176,6 +168,13 @@ export function attachX402HooksWithReserveFloor(
     if (paymentAmount <= 0n) return;
     const owner = wallet();
     const policy = policyContext(raw, owner, paymentAmount);
+    if (config.requireAllowedPayTo === true && (!config.allowedPayTo || config.allowedPayTo.length === 0)) {
+      throw new DivigentError('[@divigent/sdk] x402 payTo allowlist is required by policy', {
+        code: 'DIVIGENT_X402_PAYTO_ALLOWLIST_REQUIRED',
+        category: 'policy',
+        context: { paymentAmount, resource: policy.resource },
+      });
+    }
     if (!(await shouldHandlePaymentByPolicy(config, policy))) return;
 
     const paymentCap = effectivePaymentCap(
@@ -207,11 +206,30 @@ export function attachX402HooksWithReserveFloor(
         },
       });
     }
+    if (
+      config.maxSessionPaymentAmount !== undefined &&
+      sessionPaymentTotal + paymentAmount > config.maxSessionPaymentAmount
+    ) {
+      const remaining = config.maxSessionPaymentAmount > sessionPaymentTotal
+        ? config.maxSessionPaymentAmount - sessionPaymentTotal
+        : 0n;
+      throw new PaymentCapExceededError(paymentAmount, remaining, {
+        code: 'DIVIGENT_X402_SESSION_CAP_EXCEEDED',
+        category: 'policy',
+        context: {
+          paymentAmount,
+          sessionPaymentTotal,
+          sessionPaymentCap: config.maxSessionPaymentAmount,
+          resource: policy.resource,
+          payTo: policy.payTo,
+        },
+      });
+    }
     const key = raw.paymentRequired as object;
     handledByRequired.add(key);
 
     try {
-      await runExclusive(async () => {
+      await withOwnerLock(owner, async () => {
         const floor = reserveFloor.required();
         const balance = await divigent.usdcBalance(owner);
         const needed = paymentAmount + floor;
@@ -314,9 +332,10 @@ export function attachX402HooksWithReserveFloor(
     );
     if (paymentAmount > paymentCap) return;
 
-    await runExclusive(async () => {
-      const owner = wallet();
+    const owner = wallet();
+    await withOwnerLock(owner, async () => {
       reserveFloor.recordPayment(paymentAmount, paymentCap);
+      sessionPaymentTotal += paymentAmount;
 
       recallByRequired.delete(key);
       handledByRequired.delete(key);
@@ -360,7 +379,7 @@ export function attachX402HooksWithReserveFloor(
 
     if (state) {
       try {
-        await runExclusive(async () => {
+        await withOwnerLock(state.owner, async () => {
           const balance = await divigent.usdcBalance(state.owner);
           const excess = balance > state.balanceBefore ? balance - state.balanceBefore : 0n;
           if (excess > 0n) {
@@ -372,6 +391,11 @@ export function attachX402HooksWithReserveFloor(
               });
             } catch (_err) {
               // Redeposit failed; USDC remains liquid in the wallet.
+              await reportNonFatal(config.onNonFatalError, {
+                phase: 'x402-failure-hook',
+                error: _err,
+                recoverable: true,
+              });
             }
           }
         });
@@ -573,7 +597,7 @@ function capForResource(
   return undefined;
 }
 
-function effectivePaymentCap(
+export function effectivePaymentCap(
   config: X402WrapConfig,
   defaultCap: bigint,
   resource: string | undefined,

@@ -132,6 +132,37 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(divigent.usdcBalance).not.toHaveBeenCalled();
   });
 
+  // Exercises: supports opt-in production policy requiring an explicit payTo allowlist.
+  it('requires a payTo allowlist when configured for strict policy', async () => {
+    const { client, hooks } = createX402Client();
+    const divigent = createX402Divigent();
+    attachDivigentYield(client as never, divigent, { requireAllowedPayTo: true });
+
+    await expect(
+      hooks.before?.(x402PaymentContext({ amount: usdc('0.000001') })),
+    ).rejects.toMatchObject({ code: 'DIVIGENT_X402_PAYTO_ALLOWLIST_REQUIRED' });
+    expect(divigent.usdcBalance).not.toHaveBeenCalled();
+  });
+
+  // Exercises: enforces an optional cumulative cap for the attached x402 client session.
+  it('enforces the session payment cap after successful payment creation', async () => {
+    const { client, hooks } = createX402Client();
+    const divigent = createX402Divigent({ balances: [usdc('1'), usdc('1')] });
+    attachDivigentYield(client as never, divigent, {
+      maxPaymentAmount: usdc('1'),
+      maxSessionPaymentAmount: usdc('0.000001'),
+      minIdleThreshold: 0n,
+    });
+
+    const first = x402PaymentContext({ amount: usdc('0.000001') });
+    await hooks.before?.(first);
+    await hooks.after?.(first);
+
+    await expect(
+      hooks.before?.(x402PaymentContext({ amount: usdc('0.000001') })),
+    ).rejects.toMatchObject({ code: 'DIVIGENT_X402_SESSION_CAP_EXCEEDED' });
+  });
+
   // Exercises: uses the tighter resource-specific payment cap before checking balances.
   it('uses the tighter resource-specific payment cap before checking balances', async () => {
     const { client, hooks } = createX402Client();

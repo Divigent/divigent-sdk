@@ -9,6 +9,7 @@ export type {
   DivigentConfig,
   DivigentTransactionPlan,
   DivigentWriteRequest,
+  EnsureInitializedParams,
   SetOperatorParams,
   SignInitializeForParams,
   SignPermitParams,
@@ -22,6 +23,7 @@ export {
   CHAINS,
   ZERO_ADDRESS,
   assertProtocolDeployed,
+  chainFromId,
   getAddresses,
   getChainConfig,
   isZeroAddress,
@@ -64,11 +66,24 @@ export type {
   PaymentCreatedContext,
   X402AttachHandle,
   X402AutoDepositOptions,
+  X402IdleDepositOptions,
+  X402IncomeAttachHandle,
+  X402IncomeConfig,
   X402PolicyContext,
   X402ResourceCap,
   X402ResourcePattern,
   X402WrapConfig,
 } from './x402/types';
+export {
+  X402_USDC_EXTRA_BY_CHAIN,
+  x402UsdcExtra,
+  x402UsdcPrice,
+} from './x402/usdc';
+export type {
+  X402AssetTransferMethod,
+  X402UsdcExtra,
+  X402UsdcPrice,
+} from './x402/usdc';
 
 // Utils
 
@@ -98,6 +113,7 @@ export {
   AlreadyAttachedError,
   ChainMismatchError,
   DivigentError,
+  MinDepositNotMetError,
   OperatorAckRequiredError,
   PanicError,
   PaymentCapExceededError,
@@ -128,9 +144,9 @@ export {
 } from './core/receipts';
 
 // x402 integration
-// Public x402 onboarding is intentionally via `divigent.attachTo(x402Client)`.
-// Lower-level hook/fetch/settlement helpers remain internal for now so
-// `@divigent/sdk` stays small and obvious for non-DeFi integrators.
+// Public x402 onboarding is via `divigent.attachTo(x402Client)` for buyers
+// and `divigent.attachToResourceServer(resourceServer)` for sellers. Lower-level
+// hook/fetch/settlement helpers remain internal so the package stays small.
 
 // Raw ABIs for advanced typed viem interactions
 

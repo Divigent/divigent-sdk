@@ -5,5 +5,8 @@ dist
 !/scripts/
 !/scripts/package-smoke.mjs
 .claude
-examples
-gitbook
+examples/
+gitbook/
+.env
+.env.*
+!.env.example

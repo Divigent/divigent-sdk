@@ -117,13 +117,19 @@ export type X402WrapConfig = {
   slippageBps?: number;
   /** @notice Hard cap on per-payment amount the hook will act on. */
   maxPaymentAmount?: bigint;
+  /** @notice Optional cumulative cap for this attached client session. */
+  maxSessionPaymentAmount?: bigint;
+  /** @notice Require `allowedPayTo` to be configured before handling payments. */
+  requireAllowedPayTo?: boolean;
   /** @notice Optional payee allowlist for Divigent's recall hook. */
   allowedPayTo?: readonly string[];
   /** @notice Optional URL origin allowlist, e.g. ["https://api.example.com"]. */
   allowedOrigins?: readonly string[];
+  /** @deprecated Use `allowedOrigins`. Kept for backwards compatibility. */
   allowedOrigin?: readonly string[] | string;
   /** @notice Optional resource allowlist. String patterns support "*" wildcards. */
   allowedResources?: readonly X402ResourcePattern[];
+  /** @deprecated Use `allowedResources`. Kept for backwards compatibility. */
   allowedResource?: readonly X402ResourcePattern[] | X402ResourcePattern;
   /** @notice Optional per-resource payment caps. */
   maxPaymentAmountByResource?: Record<string, bigint> | readonly X402ResourceCap[];
@@ -160,6 +166,54 @@ export type X402AutoDepositOptions = {
   onNonFatalError?: (ctx: IntegrationErrorContext) => void | Promise<void>;
 };
 
+/** @notice Options for depositing idle wallet USDC above a reserve floor. */
+export type X402IdleDepositOptions = {
+  /** @notice Wallet to sweep. Defaults to the bound wallet client account. */
+  wallet?: EvmAddress;
+  /** @notice Minimum USDC to keep liquid in the wallet. */
+  minIdleThreshold?: bigint;
+  /** @notice EMA reserve ratio used to size the liquid payment buffer. */
+  reserveRatio?: number;
+  /** @notice Multiplier applied to the EMA-based reserve estimate. */
+  reserveMultiplier?: number;
+  /** @notice Idempotency key for settlement/income sweeps. */
+  dedupeKey?: string;
+  /** @notice Existing dedupe set for shared integrations. */
+  seenTxHashes?: Set<string>;
+  /**
+   * @notice Skip deposits below this amount. Defaults to the router's on-chain
+   * `MIN_DEPOSIT` in public SDK helpers.
+   */
+  minDeposit?: bigint | (() => bigint | Promise<bigint>);
+  /** @notice Fires after wallet USDC above the reserve floor is deposited. */
+  onIdleDeposit?: (ctx: IdleDepositContext) => void | Promise<void>;
+  /** @notice Receives non-fatal idle-deposit observer errors. */
+  onNonFatalError?: (ctx: IntegrationErrorContext) => void | Promise<void>;
+};
+
+/** @notice Seller/resource-server options for depositing received x402 income. */
+export type X402IncomeConfig = {
+  /** @notice Wallet to sweep. Defaults to the bound wallet client account. */
+  wallet?: EvmAddress;
+  /** @notice Minimum USDC to keep liquid in the seller wallet. */
+  minIdleThreshold?: bigint;
+  /** @notice EMA reserve ratio used to size the liquid buffer. */
+  reserveRatio?: number;
+  /** @notice Multiplier applied to the EMA-based reserve estimate. */
+  reserveMultiplier?: number;
+  /** @notice Maximum number of settled transaction keys remembered for dedupe. */
+  dedupeCapacity?: number;
+  /**
+   * @notice Skip deposits below this amount. Defaults to the router's on-chain
+   * `MIN_DEPOSIT` in public SDK helpers.
+   */
+  minDeposit?: bigint | (() => bigint | Promise<bigint>);
+  /** @notice Fires after received x402 income is deposited. */
+  onIdleDeposit?: (ctx: IdleDepositContext) => void | Promise<void>;
+  /** @notice Receives non-fatal income-deposit errors. */
+  onNonFatalError?: (ctx: IntegrationErrorContext) => void | Promise<void>;
+};
+
 /** @notice Handle returned by `divigent.attachTo(x402Client, config)`. */
 export type X402AttachHandle = {
   /** @notice Detach Divigent's x402 recall hooks from the client. */
@@ -179,4 +233,12 @@ export type X402AttachHandle = {
    * @remarks Useful for callers that decode settlement responses themselves.
    */
   depositIdle: (options?: X402AutoDepositOptions) => Promise<TxHash | undefined>;
+};
+
+/** @notice Handle returned by `divigent.attachToResourceServer(resourceServer, config)`. */
+export type X402IncomeAttachHandle = {
+  /** @notice Disable future seller-side income deposit hooks. */
+  detach: () => void;
+  /** @notice Deposit current seller wallet USDC above the configured reserve floor. */
+  depositIdle: (options?: X402IdleDepositOptions) => Promise<TxHash | undefined>;
 };

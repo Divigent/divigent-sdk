@@ -322,6 +322,28 @@ function readForgeArtifact(outDir: string, relativePath: string): ForgeArtifact 
   return artifact;
 }
 
+function constructorInputCount(artifact: ForgeArtifact): number {
+  const constructorAbi = artifact.abi.find((item) => item.type === 'constructor') as
+    | { inputs?: readonly unknown[] }
+    | undefined;
+  return constructorAbi?.inputs?.length ?? 0;
+}
+
+function oracleConstructorArgs(artifact: ForgeArtifact): readonly unknown[] {
+  const baseArgs = [
+    baseDependencies.aavePool,
+    baseDependencies.aToken,
+    baseDependencies.usdc,
+    baseDependencies.steakhouseUSDCPrimeVault,
+  ] as const;
+
+  const inputCount = constructorInputCount(artifact);
+  if (inputCount === baseArgs.length) return baseArgs;
+  if (inputCount === baseArgs.length + 1) return [...baseArgs, FORK_EMERGENCY_MULTISIG];
+
+  throw new Error(`Unsupported DivigentYieldOracle constructor input count: ${inputCount}`);
+}
+
 async function deployContract(params: {
   publicClient: PublicClient;
   walletClient: WalletClient;
@@ -382,12 +404,7 @@ async function deployDivigentStackOnFork(params: {
   const oracle = await deployContract({
     ...params,
     artifact: oracleArtifact,
-    args: [
-      baseDependencies.aavePool,
-      baseDependencies.aToken,
-      baseDependencies.usdc,
-      baseDependencies.steakhouseUSDCPrimeVault,
-    ],
+    args: oracleConstructorArgs(oracleArtifact),
     label: 'DivigentYieldOracle',
   });
   const feeCollector = await deployContract({

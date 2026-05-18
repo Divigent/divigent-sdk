@@ -45,9 +45,11 @@ export type MockClientOptions = {
   previewRedeem?: bigint | undefined;
   previewWithdrawNet?: bigint | undefined;
   recommendedRoute?: 0 | 1 | undefined;
+  minDeposit?: bigint | undefined;
   allowance?: bigint | undefined;
   usdcBalance?: bigint | undefined;
   dvUsdcBalance?: bigint | undefined;
+  isAuthorized?: boolean | undefined;
   simulatedApproveResult?: boolean | undefined;
   simulatedDepositResult?: bigint | undefined;
   simulatedWithdrawResult?: bigint | undefined;
@@ -83,7 +85,7 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
     if (functionName === 'previewRedeem') return opts.previewRedeem ?? usdc('2');
     if (functionName === 'previewWithdrawNet') return opts.previewWithdrawNet ?? 500_000n;
     if (functionName === 'getRecommendedRoute') return opts.recommendedRoute ?? 0;
-    if (functionName === 'MIN_DEPOSIT') return usdc('10');
+    if (functionName === 'MIN_DEPOSIT') return opts.minDeposit ?? 0n;
     if (functionName === 'allowance') return opts.allowance ?? 0n;
     if (functionName === 'balanceOf') {
       const reqAddress = String(request.address).toLowerCase();
@@ -93,6 +95,7 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
     if (functionName === 'name') return 'USD Coin';
     if (functionName === 'version') return '2';
     if (functionName === 'nonces') return 7n;
+    if (functionName === 'authorizedWallets') return opts.isAuthorized ?? false;
     if (functionName === 'USDC') return addresses.usdc;
     if (functionName === 'DV_USDC') return addresses.dvUsdc;
     if (functionName === 'FEE_COLLECTOR') return addresses.feeCollector;
@@ -114,8 +117,11 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
     if (functionName === 'withdraw') {
       return { request: { ...request, gas: 333n }, result: opts.simulatedWithdrawResult ?? usdc('1.9') };
     }
-    if (functionName === 'setOperator') {
+    if (functionName === 'initialize' || functionName === 'initializeFor') {
       return { request: { ...request, gas: 444n }, result: undefined };
+    }
+    if (functionName === 'setOperator') {
+      return { request: { ...request, gas: 555n }, result: undefined };
     }
     throw new Error(`Unhandled simulateContract function ${String(functionName)}`);
   });

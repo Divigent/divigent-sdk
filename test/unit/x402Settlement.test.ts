@@ -7,9 +7,13 @@ import {
   handleDivigentSettlement,
   wrapFetchWithDivigentYield,
 } from '../../src/x402/settlement';
+import { getAddresses } from '../../src/core/chains';
+import { x402UsdcPrice } from '../../src/x402/usdc';
 import type { TxHash } from '../../src/types';
 import {
   HASH_1,
+  HASH_2,
+  HASH_3,
   OWNER,
   SELLER,
   addresses,
@@ -77,10 +81,10 @@ describe('depositIdleAboveFloor', () => {
       }),
     ).resolves.toBe(HASH_1);
 
-    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
+    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith(expect.objectContaining({
       amount: usdc('0.000150'),
       wallet: OWNER,
-    });
+    }));
     expect(seenTxHashes.has('settlement-1')).toBe(true);
   });
 
@@ -97,10 +101,10 @@ describe('depositIdleAboveFloor', () => {
       }),
     ).resolves.toBe(HASH_1);
 
-    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
+    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith(expect.objectContaining({
       amount: usdc('11.900002'),
       wallet: OWNER,
-    });
+    }));
     expect(onIdleDeposit).toHaveBeenCalledWith(expect.objectContaining({
       reserveFloor: usdc('0.25'),
       settlementReserve: usdc('0.2'),
@@ -122,10 +126,10 @@ describe('depositIdleAboveFloor', () => {
       }),
     ).resolves.toBe(HASH_1);
 
-    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
+    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith(expect.objectContaining({
       amount: usdc('0.000150'),
       wallet: OWNER,
-    });
+    }));
     expect(onNonFatalError).toHaveBeenCalledWith(expect.objectContaining({
       phase: 'observer',
       label: 'onIdleDeposit',
@@ -217,7 +221,7 @@ describe('handleDivigentSettlement', () => {
     await expect(
       handleDivigentSettlement(
         settledResponse(),
-        settlementHttp({ success: true, transaction: 'tx-1' }) as never,
+        settlementHttp({ success: true, transaction: HASH_1 }) as never,
         divigent,
         floor,
         { seenTxHashes, resource: 'https://api.example.com/paid' },
@@ -227,7 +231,7 @@ describe('handleDivigentSettlement', () => {
     await expect(
       handleDivigentSettlement(
         settledResponse(),
-        settlementHttp({ success: true, transaction: 'tx-1' }) as never,
+        settlementHttp({ success: true, transaction: HASH_1 }) as never,
         divigent,
         floor,
         { seenTxHashes, resource: 'https://api.example.com/paid' },
@@ -235,6 +239,123 @@ describe('handleDivigentSettlement', () => {
     ).resolves.toBeUndefined();
 
     expect(divigent.depositWithPermitAndWait).toHaveBeenCalledTimes(1);
+  });
+
+  // Exercises: caps untrusted settlement header amounts by the configured payment cap.
+  it('caps settlement response amount before reserving wallet liquidity', async () => {
+    const divigent = createIncomeDivigent({ balances: [usdc('200')] });
+    const onIdleDeposit = vi.fn();
+
+    await expect(
+      handleDivigentSettlement(
+        settledResponse(),
+        settlementHttp({
+          success: true,
+          transaction: HASH_2,
+          payer: OWNER,
+          amount: usdc('1000000').toString(),
+        }) as never,
+        divigent,
+        new ReserveFloor({ minIdleThreshold: usdc('0.25') }),
+        {
+          config: { maxPaymentAmount: usdc('1') },
+          minDeposit: usdc('10'),
+          onIdleDeposit,
+        },
+      ),
+    ).resolves.toBe(HASH_1);
+
+    expect(onIdleDeposit).toHaveBeenCalledWith(expect.objectContaining({
+      settlementReserve: usdc('1'),
+      idleAmount: usdc('198.75'),
+    }));
+  });
+
+  // Exercises: treats receipt lookup failures as non-fatal retry conditions, not as zero reserve.
+  it('skips idle deposit when settlement receipt verification fails', async () => {
+    const divigent = createIncomeDivigent({ balances: [usdc('12')] });
+    Object.assign(divigent, {
+      publicClient: {
+        getTransactionReceipt: vi.fn(async () => {
+          throw new Error('rpc unavailable');
+        }),
+      },
+    });
+    const onNonFatalError = vi.fn();
+
+    await expect(
+      handleDivigentSettlement(
+        settledResponse(),
+        settlementHttp({ success: true, transaction: HASH_1 }) as never,
+        divigent,
+        new ReserveFloor({ minIdleThreshold: usdc('0.25') }),
+        { minDeposit: usdc('10'), onNonFatalError },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(divigent.depositWithPermitAndWait).not.toHaveBeenCalled();
+    expect(onNonFatalError).toHaveBeenCalledWith(expect.objectContaining({
+      phase: 'settlement',
+      recoverable: true,
+    }));
+  });
+
+  // Exercises: refuses to verify settlement receipts from a client bound to the wrong chain.
+  it('skips idle deposit when settlement receipt client is on the wrong chain', async () => {
+    const getTransactionReceipt = vi.fn();
+    const divigent = createIncomeDivigent({ balances: [usdc('12')] });
+    Object.assign(divigent, {
+      publicClient: {
+        chain: { id: 1 },
+        getTransactionReceipt,
+      },
+    });
+    const onNonFatalError = vi.fn();
+
+    await expect(
+      handleDivigentSettlement(
+        settledResponse(),
+        settlementHttp({ success: true, transaction: HASH_1 }) as never,
+        divigent,
+        new ReserveFloor({ minIdleThreshold: usdc('0.25') }),
+        { minDeposit: usdc('10'), onNonFatalError },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(getTransactionReceipt).not.toHaveBeenCalled();
+    expect(divigent.depositWithPermitAndWait).not.toHaveBeenCalled();
+    expect(onNonFatalError.mock.calls[0]?.[0].error).toMatchObject({
+      code: 'DIVIGENT_X402_SETTLEMENT_CHAIN_MISMATCH',
+    });
+  });
+
+  // Exercises: refuses to use settlement receipts from reverted transactions.
+  it('skips idle deposit when settlement transaction receipt is not successful', async () => {
+    const divigent = createIncomeDivigent({ balances: [usdc('12')] });
+    Object.assign(divigent, {
+      publicClient: {
+        getTransactionReceipt: vi.fn(async () => ({
+          status: 'reverted',
+          logs: [],
+        })),
+      },
+    });
+    const onNonFatalError = vi.fn();
+
+    await expect(
+      handleDivigentSettlement(
+        settledResponse(),
+        settlementHttp({ success: true, transaction: HASH_1 }) as never,
+        divigent,
+        new ReserveFloor({ minIdleThreshold: usdc('0.25') }),
+        { minDeposit: usdc('10'), onNonFatalError },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(divigent.depositWithPermitAndWait).not.toHaveBeenCalled();
+    expect(onNonFatalError.mock.calls[0]?.[0].error).toMatchObject({
+      code: 'DIVIGENT_X402_SETTLEMENT_TX_REVERTED',
+    });
   });
 
   // Exercises: derives settlement debit reserve from the EVM receipt when x402 omits amount.
@@ -256,21 +377,103 @@ describe('handleDivigentSettlement', () => {
         settlementHttp({ success: true, transaction: HASH_1 }) as never,
         divigent,
         new ReserveFloor({ minIdleThreshold: usdc('0.25') }),
-        { minDeposit: usdc('10'), onIdleDeposit },
+        { config: { allowedPayTo: [SELLER] }, minDeposit: usdc('10'), onIdleDeposit },
       ),
     ).resolves.toBe(HASH_1);
 
-    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
+    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith(expect.objectContaining({
       amount: usdc('11.55'),
       wallet: OWNER,
-    });
+    }));
     expect(onIdleDeposit).toHaveBeenCalledWith(expect.objectContaining({
       settlementReserve: usdc('0.2'),
     }));
   });
+
+  // Exercises: does not infer settlement reserve from arbitrary wallet-out logs without payTo policy.
+  it('requires allowedPayTo before using receipt transfer logs as settlement reserve', async () => {
+    const transfer = transferLog(OWNER, SELLER, usdc('0.2'));
+    const divigent = createIncomeDivigent({ balances: [usdc('12')] });
+    Object.assign(divigent, {
+      publicClient: {
+        getTransactionReceipt: vi.fn(async () => ({
+          status: 'success',
+          logs: [{ address: addresses.usdc, ...transfer }],
+        })),
+      },
+    });
+    const onIdleDeposit = vi.fn();
+
+    await expect(
+      handleDivigentSettlement(
+        settledResponse(),
+        settlementHttp({ success: true, transaction: HASH_1 }) as never,
+        divigent,
+        new ReserveFloor({ minIdleThreshold: usdc('0.25') }),
+        { minDeposit: usdc('10'), onIdleDeposit },
+      ),
+    ).resolves.toBe(HASH_1);
+
+    expect(onIdleDeposit).toHaveBeenCalledWith(expect.objectContaining({
+      idleAmount: usdc('11.75'),
+    }));
+    expect(onIdleDeposit.mock.calls[0]?.[0]).not.toHaveProperty('settlementReserve');
+  });
 });
 
 describe('settlement wrappers', () => {
+  // Exercises: exposes the Circle USDC x402 metadata required by Base mainnet sellers.
+  it('builds Base mainnet USDC x402 price metadata', () => {
+    expect(x402UsdcPrice({ chain: 'base', amount: 1000n })).toEqual({
+      amount: '1000',
+      asset: getAddresses('base').usdc,
+      extra: {
+        name: 'USD Coin',
+        version: '2',
+        assetTransferMethod: 'eip3009',
+      },
+    });
+
+    expect(x402UsdcPrice({
+      chain: 'base-sepolia',
+      amount: '2000',
+      asset: addresses.usdc,
+    })).toEqual({
+      amount: '2000',
+      asset: addresses.usdc,
+      extra: { assetTransferMethod: 'permit2' },
+    });
+  });
+
+  // Exercises: direct SDK idle sweep uses the protocol minimum and reserve floor.
+  it('public depositIdle deposits wallet USDC above the protocol minimum', async () => {
+    const { divigent, simulateContract } = createDivigentWithClients({
+      usdcBalance: usdc('12'),
+      simulatedDepositResult: usdc('11.75'),
+    });
+    const depositWithPermit = divigent.depositWithPermit.bind(divigent);
+    vi.spyOn(divigent, 'depositWithPermitAndWait').mockImplementation(async (params) => ({
+      txHash: await depositWithPermit(params),
+      sharesMinted: usdc('11.75'),
+    }));
+    const onIdleDeposit = vi.fn();
+
+    await expect(
+      divigent.depositIdle({ minIdleThreshold: usdc('0.25'), onIdleDeposit }),
+    ).resolves.toBe(HASH_1);
+
+    expect(simulateContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'depositWithPermit',
+      args: expect.arrayContaining([usdc('11.75'), OWNER]),
+    }));
+    expect(onIdleDeposit).toHaveBeenCalledWith(expect.objectContaining({
+      wallet: OWNER,
+      reserveFloor: usdc('0.25'),
+      idleAmount: usdc('11.75'),
+      txHash: HASH_1,
+    }));
+  });
+
   // Exercises: public attach handle wraps paid fetch and deposits post-settlement idle USDC.
   it('public attach handle wraps paid fetch and deposits idle USDC above the protocol minimum', async () => {
     const { client } = createX402Client();
@@ -291,7 +494,7 @@ describe('settlement wrappers', () => {
       inner as unknown as typeof fetch,
       settlementHttp({
         success: true,
-        transaction: 'tx-1',
+        transaction: HASH_1,
         payer: OWNER,
         amount: usdc('0.2').toString(),
       }) as never,
@@ -310,7 +513,45 @@ describe('settlement wrappers', () => {
       settlementReserve: usdc('0.2'),
       idleAmount: usdc('11.55'),
       txHash: HASH_1,
-      dedupeKey: 'tx-1',
+      dedupeKey: `84532:${HASH_1}`,
+    }));
+
+    handle.detach();
+  });
+
+  // Exercises: public seller attach handle deposits received x402 income after settlement.
+  it('public seller attach handle deposits income above the protocol minimum', async () => {
+    const onAfterSettle = vi.fn();
+    const server = { onAfterSettle };
+    const { divigent, simulateContract } = createDivigentWithClients({
+      usdcBalance: usdc('12'),
+      simulatedDepositResult: usdc('11'),
+    });
+    const depositWithPermit = divigent.depositWithPermit.bind(divigent);
+    vi.spyOn(divigent, 'depositWithPermitAndWait').mockImplementation(async (params) => ({
+      txHash: await depositWithPermit(params),
+      sharesMinted: usdc('11'),
+    }));
+    const onIdleDeposit = vi.fn();
+
+    const handle = divigent.attachToResourceServer(server as never, {
+      minIdleThreshold: usdc('1'),
+      onIdleDeposit,
+    });
+
+    const hook = onAfterSettle.mock.calls[0]?.[0] as (ctx: {
+      result: { success: boolean; transaction: TxHash };
+    }) => Promise<void>;
+    await hook({ result: { success: true, transaction: HASH_1 } });
+
+    expect(simulateContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'depositWithPermit',
+      args: expect.arrayContaining([usdc('11'), OWNER]),
+    }));
+    expect(onIdleDeposit).toHaveBeenCalledWith(expect.objectContaining({
+      reserveFloor: usdc('1'),
+      idleAmount: usdc('11'),
+      dedupeKey: `84532:${HASH_1}`,
     }));
 
     handle.detach();
@@ -326,9 +567,9 @@ describe('settlement wrappers', () => {
     const http = {
       getPaymentSettleResponse: vi
         .fn()
-        .mockReturnValueOnce({ success: true, transaction: 'tx-1' })
-        .mockReturnValueOnce({ success: true, transaction: 'tx-2' })
-        .mockReturnValueOnce({ success: true, transaction: 'tx-1' }),
+        .mockReturnValueOnce({ success: true, transaction: HASH_1 })
+        .mockReturnValueOnce({ success: true, transaction: HASH_2 })
+        .mockReturnValueOnce({ success: true, transaction: HASH_1 }),
     };
     const fetchWithYield = wrapFetchWithDivigentYield(
       inner as unknown as typeof fetch,
@@ -346,14 +587,14 @@ describe('settlement wrappers', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(divigent.depositWithPermitAndWait).toHaveBeenCalledTimes(3);
-    expect(divigent.depositWithPermitAndWait).toHaveBeenNthCalledWith(1, {
+    expect(divigent.depositWithPermitAndWait).toHaveBeenNthCalledWith(1, expect.objectContaining({
       amount: usdc('0.000150'),
       wallet: OWNER,
-    });
-    expect(divigent.depositWithPermitAndWait).toHaveBeenNthCalledWith(3, {
+    }));
+    expect(divigent.depositWithPermitAndWait).toHaveBeenNthCalledWith(3, expect.objectContaining({
       amount: usdc('0.000170'),
       wallet: OWNER,
-    });
+    }));
   });
 
   // Exercises: derives settlement resources from string, URL, and Request fetch inputs.
@@ -363,13 +604,14 @@ describe('settlement wrappers', () => {
       new URL('https://api.example.com/paid'),
       new Request('https://api.example.com/paid'),
     ];
+    const txHashes = [HASH_1, HASH_2, HASH_3] as const;
 
     for (const [index, input] of inputs.entries()) {
       const divigent = createIncomeDivigent({ balances: [usdc('0.000250')] });
       const inner = vi.fn(async () => settledResponse());
       const fetchWithYield = wrapFetchWithDivigentYield(
         inner as unknown as typeof fetch,
-        settlementHttp({ success: true, transaction: `tx-${index}` }) as never,
+        settlementHttp({ success: true, transaction: txHashes[index] }) as never,
         divigent,
         new ReserveFloor({ minIdleThreshold: usdc('0.000100') }),
         { config: { allowedOrigin: 'https://api.example.com' } },
@@ -378,10 +620,10 @@ describe('settlement wrappers', () => {
       await fetchWithYield(input);
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
+      expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith(expect.objectContaining({
         amount: usdc('0.000150'),
         wallet: OWNER,
-      });
+      }));
     }
   });
 
@@ -393,7 +635,7 @@ describe('settlement wrappers', () => {
     const onNonFatalError = vi.fn();
     const fetchWithYield = wrapFetchWithDivigentYield(
       inner as unknown as typeof fetch,
-      settlementHttp({ success: true, transaction: 'tx-1' }) as never,
+      settlementHttp({ success: true, transaction: HASH_1 }) as never,
       divigent,
       floor,
       { config: { onNonFatalError } },
@@ -403,10 +645,10 @@ describe('settlement wrappers', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(response).toBeInstanceOf(Response);
-    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
+    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith(expect.objectContaining({
       amount: usdc('0.000150'),
       wallet: OWNER,
-    });
+    }));
     expect(onNonFatalError).not.toHaveBeenCalled();
   });
 
@@ -418,7 +660,7 @@ describe('settlement wrappers', () => {
     const onNonFatalError = vi.fn();
     const fetchWithYield = wrapFetchWithDivigentYield(
       inner as unknown as typeof fetch,
-      settlementHttp({ success: true, transaction: 'tx-1' }) as never,
+      settlementHttp({ success: true, transaction: HASH_1 }) as never,
       divigent,
       floor,
       { config: { onNonFatalError } },

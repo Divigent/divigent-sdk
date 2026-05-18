@@ -5,7 +5,7 @@ import { base } from 'viem/chains';
 import { Divigent } from '../../src/divigent';
 import { parseUsdc } from '../../src/core/utils';
 import type { EvmAddress } from '../../src/types';
-import { divigentBaseMainnetForkTest as test } from './setup';
+import { divigentBaseMainnetForkTest as test, withForkSnapshot } from './setup';
 
 // Smoke/preflight coverage for Base fork setup. Function-level behavior lives
 // in test/integration/* so reviewers can inspect each SDK flow directly.
@@ -64,7 +64,8 @@ test.sequential(
 // Exercises: broadcasts a real approval transaction against forked Base mainnet USDC.
 test.sequential(
   'broadcasts a real approval transaction against forked Base mainnet USDC',
-  async ({ account, divigent, publicClient }) => {
+  async ({ account, divigent, publicClient, rpcUrl }) => {
+    await withForkSnapshot(rpcUrl, async () => {
     const amount = parseUsdc('0.123456');
 
     const plan = await divigent.planApproveUsdc(amount);
@@ -80,5 +81,6 @@ test.sequential(
 
     expect(receipt.status).toBe('success');
     expect(allowance).toBe(amount);
+    });
   },
 );

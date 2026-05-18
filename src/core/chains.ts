@@ -34,10 +34,10 @@ export const CHAINS = {
     name: 'base',
     viemChain: base,
     addresses: {
-      router:                   ZERO_ADDRESS,
-      oracle:                   ZERO_ADDRESS,
-      feeCollector:             ZERO_ADDRESS,
-      dvUsdc:                   ZERO_ADDRESS,
+      router:                   evmAddress('0xE958A89c2CCa697d4896990685800cc1D5AF2A01'),
+      oracle:                   evmAddress('0x3Ba775E8fAE60E72c99dE10C720fC44ab38BF71A'),
+      feeCollector:             evmAddress('0x1a2eF76E6E323D95f836917f812f6D159c3A0960'),
+      dvUsdc:                   evmAddress('0x1497f7F3b156e110b1d90BC7F1759F40fb48Ea4F'),
       usdc:                     evmAddress('0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'),
       aavePool:                 evmAddress('0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'),
       aToken:                   evmAddress('0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB'),
@@ -85,6 +85,16 @@ export function getChainConfig(chain: DivigentChain): ChainConfig {
  */
 export function getAddresses(chain: DivigentChain): ContractAddresses {
   return getChainConfig(chain).addresses;
+}
+
+/**
+ * @notice Resolve a Divigent chain name from an EVM chain id.
+ * @param chainId EVM chain id.
+ * @returns Supported Divigent chain name, or undefined for unsupported ids.
+ */
+export function chainFromId(chainId: number): DivigentChain | undefined {
+  const entries = Object.entries(CHAINS) as Array<[DivigentChain, ChainConfig]>;
+  return entries.find(([, config]) => config.id === chainId)?.[0];
 }
 
 /**
