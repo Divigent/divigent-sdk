@@ -3,6 +3,8 @@
 Viem-native TypeScript SDK for the Divigent yield router on Base mainnet and
 Base Sepolia.
 
+Current release line: `1.0.3`.
+
 ## Mainnet Notice
 
 Mainnet support uses real Base USDC and broadcasts real transactions. Keep
@@ -12,7 +14,7 @@ and test on Base Sepolia or a Base fork before moving meaningful funds.
 ## Install
 
 ```bash
-npm install @divigent/sdk viem @x402/core
+npm install @divigent/sdk@^1.0.3 viem @x402/core
 ```
 
 Requires Node.js 20.10 or newer.
@@ -68,6 +70,7 @@ Built-in deployments:
 Common read methods:
 
 - `getPosition(wallet)`
+- `assessLiquidity(params)`
 - `withdrawCapacity()`
 - `getCurrentAllocation()`
 - `getRecommendedRoute(amount)`
@@ -85,11 +88,15 @@ Common write methods:
 - `planDeposit(params)`
 - `planWithdraw(params)`
 - `sendPlan(plan)`
+- `sendPlans(plans)`
 - `approveUsdc(amount)` (approves a deposit-safe allowance)
 - `deposit(params)`
 - `depositAndWait(params)`
+- `depositWithApproval(params)`
+- `depositWithApprovalAndWait(params)`
 - `withdraw(params)`
 - `withdrawAndWait(params)`
+- `ensurePaymentReady(params)`
 
 Planning methods return viem-ready requests without broadcasting transactions.
 
@@ -99,6 +106,81 @@ Helpers:
 - `formatUsdc(value)`
 - `evmAddress(value)`
 - `txHash(value)`
+
+## Liquidity Intelligence
+
+`assessLiquidity(...)` is the read-only intelligence layer for agent wallets,
+seller treasuries, and policy engines. It answers whether a wallet can pay,
+whether liquidity should be recalled from Divigent, how much idle USDC is
+deployable, and which Divigent venue would be used.
+
+```ts
+const assessment = await divigent.assessLiquidity({
+  wallet: evmAddress(account.address),
+  pendingPaymentAmount: parseUsdc('2.50'),
+  policyContext: {
+    minOperatingBalance: parseUsdc('0.25'),
+    upcomingKnownPayouts: parseUsdc('1'),
+    maxDeployablePercent: 75,
+    riskPreference: 'balanced',
+  },
+  includeVenueHealth: true,
+});
+
+console.log(assessment.paymentReady);
+console.log(assessment.requiredReserve);
+console.log(assessment.deployableExcess);
+console.log(assessment.recommendedActions);
+```
+
+`ensurePaymentReady(...)` is the execution layer. It recalls USDC only when the
+wallet needs liquidity for the pending payment by default; reserve-only top-ups
+are opt-in with `reserveTopUp: 'opportunistic'`.
+
+```ts
+const result = await divigent.ensurePaymentReady({
+  pendingPaymentAmount: parseUsdc('2.50'),
+  minOperatingBalance: parseUsdc('0.25'),
+});
+
+if (result.recallTxHash) {
+  console.log(`recall tx: ${result.recallTxHash}`);
+}
+```
+
+Risk preferences tune the reserve posture, not the protocol venue set. Divigent
+still routes only through its approved Base venues, currently Aave V3 and
+Morpho Steakhouse USDC.
+
+## Smart Accounts
+
+The SDK can route writes through a pluggable executor. Without an executor,
+`sendPlans(...)` broadcasts EOA transactions sequentially. With an executor,
+plans are converted into raw calls and submitted as one batched operation.
+
+```ts
+import { Divigent, createEip5792Executor } from '@divigent/sdk';
+
+const executor = createEip5792Executor({
+  walletClient,
+  experimentalFallback: true,
+});
+
+const smartDivigent = Divigent.create({
+  publicClient,
+  walletClient,
+  chain: 'base',
+  executor,
+});
+
+await smartDivigent.depositWithApprovalAndWait({
+  amount: parseUsdc('10'),
+});
+```
+
+`createEip5792Executor(...)` is viem-native and uses wallet call bundles where
+available. ERC-4337, Safe, or vendor bundlers can be integrated by providing a
+custom `DivigentCallExecutor`.
 
 ## x402
 
@@ -137,6 +219,15 @@ The buyer fetch wrapper waits until x402 settlement succeeds, then deposits
 wallet USDC above the configured idle buffer back into Divigent. Seller
 integrations can attach `divigent.attachToResourceServer(resourceServer, config)`
 to sweep merchant income into Divigent after x402 settlement.
+
+Both x402 handles expose `assessLiquidity(...)`, so callers can inspect the same
+adaptive reserve state that the hooks learned from recent payments:
+
+```ts
+const assessment = await handle.assessLiquidity({
+  pendingPaymentAmount: parseUsdc('1'),
+});
+```
 
 If a just-in-time recall cannot make at least the payment amount liquid, the SDK
 aborts before x402 signs a payment authorization and throws a `DivigentError`
@@ -237,16 +328,6 @@ decoding, receipt parsing, planning behavior, and x402 policy/settlement logic.
 Fork tests run against a deterministic Base mainnet block with Anvil, validating
 real protocol wiring, deposits, withdrawals, permit deposits, operator flows,
 routing behavior, pause/treasury/oracle lifecycle paths, and x402 recall
-behavior against deployed venue dependencies.
-
-Before publishing a release, run:
-
-```bash
-npm run prepublishOnly
-npm test
-npm run test:fork:base
-npm run test:integration:base
-npm run test:x402:local
-git diff --check
-npm pack --dry-run --json
-```
+behavior against deployed venue dependencies. The integration fork suite also
+covers liquidity intelligence, `ensurePaymentReady`, x402 buyer/seller hooks,
+and executor-backed approval deposits.
