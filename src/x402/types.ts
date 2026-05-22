@@ -1,4 +1,5 @@
 import type { DivigentError } from '../errors';
+import type { AssessLiquidityParams, LiquidityAssessment } from '../divigent';
 import type { EvmAddress, Prettify, TxHash } from '../types';
 import type { x402HTTPClient } from '@x402/core/client';
 
@@ -105,7 +106,12 @@ export type X402PolicyContext = Prettify<{
   raw: unknown;
 }>;
 
-/** @notice Configuration for attaching Divigent liquidity hooks to an x402 client. */
+/**
+ * @notice Configuration for attaching Divigent liquidity hooks to an x402 client.
+ * @remarks Allowlists and `shouldHandlePayment` scope where Divigent is allowed
+ * to move liquidity. Off-scope payments continue through the underlying x402
+ * client and do not run Divigent cap/recall logic.
+ */
 export type X402WrapConfig = {
   /** @notice Minimum USDC to keep liquid in the wallet before/after payments. */
   minIdleThreshold?: bigint;
@@ -115,25 +121,25 @@ export type X402WrapConfig = {
   reserveMultiplier?: number;
   /** @notice Slippage guard for vault withdrawals used by the x402 recall path. */
   slippageBps?: number;
-  /** @notice Hard cap on per-payment amount the hook will act on. */
+  /** @notice Hard cap on per-payment amount for payments Divigent is configured to handle. */
   maxPaymentAmount?: bigint;
   /** @notice Optional cumulative cap for this attached client session. */
   maxSessionPaymentAmount?: bigint;
-  /** @notice Require `allowedPayTo` to be configured before handling payments. */
+  /** @notice Configuration guard requiring a non-empty payee allowlist before handling payments. */
   requireAllowedPayTo?: boolean;
-  /** @notice Optional payee allowlist for Divigent's recall hook. */
+  /** @notice Optional payee allowlist that scopes Divigent's recall hook. */
   allowedPayTo?: readonly string[];
-  /** @notice Optional URL origin allowlist, e.g. ["https://api.example.com"]. */
+  /** @notice Optional URL origin allowlist that scopes Divigent's recall hook. */
   allowedOrigins?: readonly string[];
   /** @deprecated Use `allowedOrigins`. Kept for backwards compatibility. */
   allowedOrigin?: readonly string[] | string;
-  /** @notice Optional resource allowlist. String patterns support "*" wildcards. */
+  /** @notice Optional resource allowlist that scopes Divigent's recall hook. String patterns support "*" wildcards. */
   allowedResources?: readonly X402ResourcePattern[];
   /** @deprecated Use `allowedResources`. Kept for backwards compatibility. */
   allowedResource?: readonly X402ResourcePattern[] | X402ResourcePattern;
-  /** @notice Optional per-resource payment caps. */
+  /** @notice Optional per-resource caps for payments Divigent is configured to handle. */
   maxPaymentAmountByResource?: Record<string, bigint> | readonly X402ResourceCap[];
-  /** @notice Last-mile predicate for advanced agent policy. */
+  /** @notice Last-mile predicate that can opt a payment into or out of Divigent handling. */
   shouldHandlePayment?: (ctx: X402PolicyContext) => boolean | Promise<boolean>;
   /** @notice Redact wallet addresses and tx hashes in observer callbacks. */
   redact?: boolean;
@@ -219,6 +225,11 @@ export type X402AttachHandle = {
   /** @notice Detach Divigent's x402 recall hooks from the client. */
   detach: () => void;
   /**
+   * @notice Assess liquidity using the same reserve floor state maintained by
+   * the attached x402 hooks.
+   */
+  assessLiquidity: (options?: AssessLiquidityParams) => Promise<LiquidityAssessment>;
+  /**
    * @notice Wrap a payment-enabled fetch so successful x402 settlements deposit
    * wallet USDC above the reserve floor back into Divigent.
    */
@@ -239,6 +250,8 @@ export type X402AttachHandle = {
 export type X402IncomeAttachHandle = {
   /** @notice Disable future seller-side income deposit hooks. */
   detach: () => void;
+  /** @notice Assess seller-wallet liquidity using the income hook reserve state. */
+  assessLiquidity: (options?: AssessLiquidityParams) => Promise<LiquidityAssessment>;
   /** @notice Deposit current seller wallet USDC above the configured reserve floor. */
   depositIdle: (options?: X402IdleDepositOptions) => Promise<TxHash | undefined>;
 };

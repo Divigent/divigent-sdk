@@ -4,8 +4,8 @@ import { type EvmAddress, evmAddress } from '../types';
 
 export type DivigentChain = 'base' | 'base-sepolia';
 
-/** @notice Contract addresses needed to operate one Divigent deployment. */
-export type ContractAddresses = {
+/** @notice Address fields shared by the current and legacy registry shapes. */
+type ContractAddressBase = {
   router:                   EvmAddress;
   oracle:                   EvmAddress;
   feeCollector:             EvmAddress;
@@ -13,8 +13,24 @@ export type ContractAddresses = {
   usdc:                     EvmAddress;
   aavePool:                 EvmAddress;
   aToken:                   EvmAddress;
+};
+
+/** @notice Contract addresses needed to operate one Divigent deployment. */
+export type ContractAddresses = ContractAddressBase & {
+  steakhouseUSDCVault: EvmAddress;
+  /** @deprecated Use `steakhouseUSDCVault`. */
+  steakhouseUSDCPrimeVault?: EvmAddress;
+};
+
+/** @notice Deprecated address override shape accepted for v1 migration compatibility. */
+export type LegacyContractAddresses = ContractAddressBase & {
+  steakhouseUSDCVault?: EvmAddress;
+  /** @deprecated Use `steakhouseUSDCVault`. */
   steakhouseUSDCPrimeVault: EvmAddress;
 };
+
+/** @notice Address overrides accepted by `Divigent.create`. */
+export type ContractAddressOverrides = ContractAddresses | LegacyContractAddresses;
 
 /** @notice Chain metadata plus the default address registry for that chain. */
 export type ChainConfig = {
@@ -41,7 +57,7 @@ export const CHAINS = {
       usdc:                     evmAddress('0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'),
       aavePool:                 evmAddress('0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'),
       aToken:                   evmAddress('0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB'),
-      steakhouseUSDCPrimeVault: evmAddress('0xbeeF010f9cb27031ad51e3333f9aF9C6B1228183'),
+      steakhouseUSDCVault:      evmAddress('0xbeeF010f9cb27031ad51e3333f9aF9C6B1228183'),
     },
   },
   'base-sepolia': {
@@ -56,7 +72,7 @@ export const CHAINS = {
       usdc:                     evmAddress('0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f'),
       aavePool:                 evmAddress('0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27'),
       aToken:                   evmAddress('0x10F1A9D11CDf50041f3f8cB7191CBE2f31750ACC'),
-      steakhouseUSDCPrimeVault: evmAddress('0x7d646Ac22d219507f02D9154a321f34c6F0f3b08'),
+      steakhouseUSDCVault:      evmAddress('0x7d646Ac22d219507f02D9154a321f34c6F0f3b08'),
     },
   },
 } as const satisfies Record<DivigentChain, ChainConfig>;

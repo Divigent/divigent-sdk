@@ -93,7 +93,7 @@ function expectedOptimalVaultType(rates: VaultRate[]): VaultType {
 }
 
 function expectedVaultAddress(addresses: ContractAddresses, vaultType: VaultType): EvmAddress {
-  return vaultType === 'AAVE' ? addresses.aavePool : addresses.steakhouseUSDCPrimeVault;
+  return vaultType === 'AAVE' ? addresses.aavePool : addresses.steakhouseUSDCVault;
 }
 
 function allocationDelta(
@@ -115,9 +115,9 @@ async function expectRealBaseVenueWiring(params: {
   expect(addresses.usdc).toBe(REAL_BASE_FORK_DEPENDENCIES.usdc);
   expect(addresses.aavePool).toBe(REAL_BASE_FORK_DEPENDENCIES.aavePool);
   expect(addresses.aToken).toBe(REAL_BASE_FORK_DEPENDENCIES.aaveAToken);
-  expect(addresses.steakhouseUSDCPrimeVault).toBe(REAL_BASE_FORK_DEPENDENCIES.morphoVault);
+  expect(addresses.steakhouseUSDCVault).toBe(REAL_BASE_FORK_DEPENDENCIES.morphoVault);
   const morphoAsset = await publicClient.readContract({
-    address: addresses.steakhouseUSDCPrimeVault,
+    address: addresses.steakhouseUSDCVault,
     abi: morphoVaultAbi,
     functionName: 'asset',
   });
@@ -143,14 +143,14 @@ async function readVenueHoldings(params: {
       args: [addresses.router],
     }),
     publicClient.readContract({
-      address: addresses.steakhouseUSDCPrimeVault,
+      address: addresses.steakhouseUSDCVault,
       abi: morphoVaultAbi,
       functionName: 'balanceOf',
       args: [addresses.router],
     }),
   ]);
   const routerMorphoAssets = await publicClient.readContract({
-    address: addresses.steakhouseUSDCPrimeVault,
+    address: addresses.steakhouseUSDCVault,
     abi: morphoVaultAbi,
     functionName: 'convertToAssets',
     args: [routerMorphoShares],

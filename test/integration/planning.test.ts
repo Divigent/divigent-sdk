@@ -34,10 +34,11 @@ test.sequential(
       expect(approvePlan.token).toBe(agent.sdk.addresses.usdc);
       expect(approvePlan.spender).toBe(agent.sdk.addresses.router);
       expect(approvePlan.amount).toBe(amount);
+      expect(approvePlan.approvalAmount).toBe(amount + 1n);
       expect(approvePlan.simulationResult).toBe(true);
       const approveHash = await agent.sdk.sendPlan(approvePlan);
       await sendAndExpectSuccess(publicClient, approveHash);
-      await expect(agent.sdk.usdcAllowance(agent.wallet)).resolves.toBe(amount);
+      await expect(agent.sdk.usdcAllowance(agent.wallet)).resolves.toBe(amount + 1n);
 
       const depositPlan = await agent.sdk.planDeposit({ amount, slippageBps: 25 });
       expect(depositPlan.simulated).toBe(true);

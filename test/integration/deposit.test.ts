@@ -27,7 +27,7 @@ test.sequential(
       await expect(agent.sdk.usdcBalance(agent.wallet)).resolves.toBe(fundingAmount);
 
       await approveUsdcAndWait(agent, publicClient, depositAmount);
-      await expect(agent.sdk.usdcAllowance(agent.wallet)).resolves.toBe(depositAmount);
+      await expect(agent.sdk.usdcAllowance(agent.wallet)).resolves.toBe(depositAmount + 1n);
 
       const depositPlan = await agent.sdk.planDeposit({ amount: depositAmount, slippageBps: 25 });
       expect(depositPlan.wallet).toBe(agent.wallet);
@@ -40,7 +40,7 @@ test.sequential(
         amount: depositAmount,
         sharesMinted: deposit.sharesMinted,
         liquidUsdc: fundingAmount - depositAmount,
-        allowance: 0n,
+        allowance: 1n,
       });
     });
   },

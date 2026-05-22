@@ -8,6 +8,7 @@ import {
   OWNER,
   SELLER,
   addresses,
+  createDivigentWithClients,
   createX402Client,
   createX402Divigent,
   usdc,
@@ -118,6 +119,31 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     expect(() => attachDivigentYield(client as never, divigent)).toThrow(AlreadyAttachedError);
     handle.detach();
     expect(() => attachDivigentYield(client as never, divigent)).not.toThrow();
+  });
+
+  // Exercises: the attach handle assessment uses the same EMA observed by x402 hooks.
+  it('exposes liquidity assessment backed by the attached reserve floor EMA', async () => {
+    const { client, hooks } = createX402Client();
+    const { divigent } = createDivigentWithClients({
+      usdcBalance: usdc('100'),
+      minDeposit: 0n,
+    });
+    const handle = divigent.attachTo(client as never, {
+      minIdleThreshold: 0n,
+      reserveRatio: 0.1,
+      reserveMultiplier: 3,
+      maxPaymentAmount: usdc('1'),
+    });
+    const payment = x402PaymentContext({ amount: usdc('1') });
+
+    await hooks.before?.(payment);
+    await hooks.after?.(payment);
+
+    await expect(handle.assessLiquidity({ minDeposit: 0n }))
+      .resolves.toMatchObject({
+        adaptiveReserve: usdc('0.06'),
+        requiredReserve: usdc('0.06'),
+      });
   });
 
   // Exercises: enforces payment caps before recall.

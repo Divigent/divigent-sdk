@@ -80,7 +80,7 @@ test.sequential(
     const allowance = await divigent.usdcAllowance(account.address as EvmAddress);
 
     expect(receipt.status).toBe('success');
-    expect(allowance).toBe(amount);
+    expect(allowance).toBe(amount + 1n);
     });
   },
 );

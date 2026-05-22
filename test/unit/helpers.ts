@@ -32,7 +32,7 @@ export const addresses: ContractAddresses = {
   usdc: evmAddress('0x1000000000000000000000000000000000000005'),
   aavePool: evmAddress('0x1000000000000000000000000000000000000006'),
   aToken: evmAddress('0x1000000000000000000000000000000000000007'),
-  steakhouseUSDCPrimeVault: evmAddress('0x1000000000000000000000000000000000000008'),
+  steakhouseUSDCVault: evmAddress('0x1000000000000000000000000000000000000008'),
 };
 
 export type MockClientOptions = {
@@ -46,6 +46,7 @@ export type MockClientOptions = {
   previewWithdrawNet?: bigint | undefined;
   recommendedRoute?: 0 | 1 | undefined;
   minDeposit?: bigint | undefined;
+  position?: readonly [bigint, bigint, bigint] | undefined;
   allowance?: bigint | undefined;
   usdcBalance?: bigint | undefined;
   dvUsdcBalance?: bigint | undefined;
@@ -86,6 +87,37 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
     if (functionName === 'previewWithdrawNet') return opts.previewWithdrawNet ?? 500_000n;
     if (functionName === 'getRecommendedRoute') return opts.recommendedRoute ?? 0;
     if (functionName === 'MIN_DEPOSIT') return opts.minDeposit ?? 0n;
+    if (functionName === 'getPosition') return opts.position ?? [0n, 0n, 0n];
+    if (functionName === 'withdrawCapacity') {
+      return {
+        aaveAssetsHeld: 0n,
+        aaveIdleLiquidity: 0n,
+        aaveWithdrawCap: 0n,
+        morphoAssetsHeld: 0n,
+        morphoWithdrawCap: 0n,
+        morphoReachable: true,
+        totalWithdrawCap: 0n,
+      };
+    }
+    if (functionName === 'getCurrentAllocation') return [0n, 0n];
+    if (functionName === 'lastObservationTime') return 1_000n;
+    if (functionName === 'isFresh') return true;
+    if (functionName === 'getAllRates') return [
+      {
+        vault: addresses.aToken,
+        vaultType: 0,
+        spotRate: 0n,
+        twarRate: 0n,
+        isSafe: true,
+      },
+      {
+        vault: addresses.steakhouseUSDCVault,
+        vaultType: 1,
+        spotRate: 0n,
+        twarRate: 0n,
+        isSafe: true,
+      },
+    ];
     if (functionName === 'allowance') return opts.allowance ?? 0n;
     if (functionName === 'balanceOf') {
       const reqAddress = String(request.address).toLowerCase();

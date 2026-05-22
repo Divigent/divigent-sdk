@@ -1,12 +1,18 @@
 import { expect, vi } from 'vitest';
+import { createWalletClient, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { base } from 'viem/chains';
+import { usdcAbi } from '../../src/abis';
 import { parseUsdc } from '../../src/core/utils';
 import { divigentBaseMainnetForkTest as test } from '../fork/setup';
 import {
   createLocalX402Client,
   expectDepositedEvent,
   readAgentBalances,
+  sendAndExpectSuccess,
   withPreparedAgent,
   X402_AGENT_AUTO_DEPOSIT_PRIVATE_KEY,
+  X402_SELLER,
   X402_SAFE_RESOURCE,
 } from './helpers/x402AgentFork';
 
@@ -26,8 +32,7 @@ test.sequential(
     const fundingAmount = parseUsdc('25');
     const reserveFloor = parseUsdc('1');
     const settlementAmount = parseUsdc('0.2');
-    const expectedIdleDeposit = fundingAmount - reserveFloor - settlementAmount;
-    const settlementTx = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const expectedIdleDeposit = fundingAmount - settlementAmount - reserveFloor - settlementAmount;
 
     await withPreparedAgent({
       privateKey: X402_AGENT_AUTO_DEPOSIT_PRIVATE_KEY,
@@ -41,15 +46,29 @@ test.sequential(
       expect(before.liquidUsdc).toBe(fundingAmount);
       expect(before.dvUsdc).toBe(0n);
 
+      const payerClient = createWalletClient({
+        account: privateKeyToAccount(X402_AGENT_AUTO_DEPOSIT_PRIVATE_KEY),
+        chain: base,
+        transport: http(rpcUrl),
+      });
+      const settlementTx = await payerClient.writeContract({
+        address: agent.sdk.addresses.usdc,
+        abi: usdcAbi,
+        functionName: 'transfer',
+        args: [X402_SELLER, settlementAmount],
+      });
+      await sendAndExpectSuccess(publicClient, settlementTx);
+
       const { client } = createLocalX402Client();
       const handle = agent.sdk.attachTo(client as never, {
         minIdleThreshold: reserveFloor,
         reserveRatio: 0,
         reserveMultiplier: 0,
+        allowedPayTo: [X402_SELLER],
         allowedResource: X402_SAFE_RESOURCE,
       });
       const paidFetch = vi.fn(async () => paidResponse(X402_SAFE_RESOURCE));
-      const http = {
+      const httpClient = {
         getPaymentSettleResponse: vi.fn(() => ({
           success: true,
           transaction: settlementTx,
@@ -61,21 +80,21 @@ test.sequential(
 
       const fetchWithYield = handle.wrapFetchWithYield(
         paidFetch as unknown as typeof fetch,
-        http as never,
+        httpClient as never,
         { waitForIdleDeposit: true, onIdleDeposit },
       );
 
       const response = await fetchWithYield(X402_SAFE_RESOURCE);
       expect(response.status).toBe(200);
       expect(paidFetch).toHaveBeenCalledTimes(1);
-      expect(http.getPaymentSettleResponse).toHaveBeenCalledTimes(1);
+      expect(httpClient.getPaymentSettleResponse).toHaveBeenCalledTimes(1);
 
       const after = await readAgentBalances(agent);
       expect(after.liquidUsdc).toBe(reserveFloor + settlementAmount);
       expect(after.dvUsdc).toBeGreaterThan(0n);
       expect(onIdleDeposit).toHaveBeenCalledWith(expect.objectContaining({
         wallet: agent.wallet,
-        walletBalance: fundingAmount,
+        walletBalance: fundingAmount - settlementAmount,
         reserveFloor,
         settlementReserve: settlementAmount,
         idleAmount: expectedIdleDeposit,

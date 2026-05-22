@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ContractFunctionRevertedError, encodeErrorResult } from 'viem';
 import { base, baseSepolia } from 'viem/chains';
-import { routerAbi } from '../../src/abis';
-import { Divigent } from '../../src/divigent';
+import { routerAbi, usdcAbi } from '../../src/abis';
+import { Divigent, type DivigentTransactionPlan } from '../../src/divigent';
+import type { DivigentCallExecutor } from '../../src/execution';
 import {
   AddressMismatchError,
   ChainMismatchError,
@@ -17,6 +18,7 @@ import { getAddresses, isZeroAddress } from '../../src/core/chains';
 import {
   HASH_1,
   HASH_2,
+  HASH_3,
   OPERATOR,
   OWNER,
   SECOND_OWNER,
@@ -104,6 +106,24 @@ describe('Divigent config and wallet guards', () => {
     expect(isZeroAddress(mainnet.oracle)).toBe(false);
     expect(isZeroAddress(mainnet.feeCollector)).toBe(false);
     expect(isZeroAddress(mainnet.dvUsdc)).toBe(false);
+  });
+  // Exercises: accepts the deprecated Steakhouse Prime field as an address override alias.
+  it('normalizes legacy Steakhouse Prime override aliases', () => {
+    const { publicClient, walletClient } = createMockClients();
+    const { steakhouseUSDCVault, ...withoutNewName } = addresses;
+
+    const divigent = Divigent.create({
+      publicClient,
+      walletClient,
+      chain: 'base-sepolia',
+      addresses: {
+        ...withoutNewName,
+        steakhouseUSDCPrimeVault: steakhouseUSDCVault,
+      },
+    });
+
+    expect(divigent.addresses.steakhouseUSDCVault).toBe(steakhouseUSDCVault);
+    expect(divigent.addresses.steakhouseUSDCPrimeVault).toBe(steakhouseUSDCVault);
   });
   // Exercises: infers the deployment chain from bound viem clients when callers omit `chain`.
   it('infers Base mainnet from viem client chain ids when chain is omitted', () => {
@@ -488,6 +508,220 @@ describe('transaction planning', () => {
     await expect(divigent.sendPlan(plan)).resolves.toBe(HASH_2);
     expect(writeContract).toHaveBeenCalledWith(plan.request);
   });
+  // Exercises: executor-backed planning uses the executor account and routes calls through executeCalls.
+  it('routes planned writes through a configured executor', async () => {
+    const { publicClient, simulateContract, writeContract } = createMockClients();
+    const executeCalls = vi.fn(async () => ({ txHash: HASH_2 }));
+    const executor: DivigentCallExecutor = {
+      account: OWNER,
+      kind: 'custom',
+      executeCalls,
+    };
+    const divigent = Divigent.create({
+      publicClient,
+      executor,
+      chain: 'base-sepolia',
+      addresses,
+    });
+
+    const plan = await divigent.planApproveUsdc(usdc('0.001'));
+
+    expect(plan.owner).toBe(OWNER);
+    expect(plan.request).toMatchObject({
+      account: OWNER,
+      functionName: 'approve',
+    });
+    await expect(divigent.sendPlan(plan)).resolves.toBe(HASH_2);
+    expect(writeContract).not.toHaveBeenCalled();
+    expect(executeCalls).toHaveBeenCalledWith(
+      [expect.objectContaining({
+        to: addresses.usdc,
+        data: expect.stringMatching(/^0x095ea7b3/),
+      })],
+      expect.objectContaining({
+        chain: 'base-sepolia',
+        chainId: baseSepolia.id,
+        addresses,
+      }),
+    );
+    expect(simulateContract).toHaveBeenCalledWith(expect.objectContaining({
+      account: OWNER,
+      functionName: 'approve',
+    }));
+  });
+
+  // Exercises: executor bundles can resolve asynchronously through waitForResult.
+  it('resolves executor call-bundle handles through waitForResult', async () => {
+    const { publicClient } = createMockClients();
+    const executeCalls = vi.fn(async () => ({ callBundleId: 'bundle-1' }));
+    const waitForResult = vi.fn(async () => ({ txHash: HASH_3 }));
+    const divigent = Divigent.create({
+      publicClient,
+      executor: {
+        account: OWNER,
+        kind: 'custom',
+        executeCalls,
+        waitForResult,
+      },
+      chain: 'base-sepolia',
+      addresses,
+    });
+    const plan = await divigent.planApproveUsdc(usdc('0.001'));
+
+    await expect(divigent.sendPlans([plan], { confirmations: 2 }))
+      .resolves.toMatchObject({
+        mode: 'batched',
+        txHashes: [HASH_3],
+        handle: { callBundleId: 'bundle-1' },
+      });
+
+    expect(waitForResult).toHaveBeenCalledWith(
+      { callBundleId: 'bundle-1' },
+      expect.objectContaining({
+        waitOptions: { confirmations: 2 },
+      }),
+    );
+  });
+
+  // Exercises: executor call conversion fails fast when calldata args are malformed.
+  it('rejects executor plans with missing ABI arguments before broadcasting', async () => {
+    const { publicClient } = createMockClients();
+    const executeCalls = vi.fn(async () => ({ txHash: HASH_1 }));
+    const divigent = Divigent.create({
+      publicClient,
+      executor: {
+        account: OWNER,
+        kind: 'custom',
+        executeCalls,
+      },
+      chain: 'base-sepolia',
+      addresses,
+    });
+    const plan = {
+      kind: 'approveUsdc',
+      owner: OWNER,
+      request: {
+        address: addresses.usdc,
+        abi: usdcAbi,
+        functionName: 'approve',
+        account: OWNER,
+      },
+    } as unknown as DivigentTransactionPlan;
+
+    await expect(divigent.sendPlan(plan)).rejects.toMatchObject({
+      code: 'DIVIGENT_PLAN_ARGS_MISSING',
+    });
+    expect(executeCalls).not.toHaveBeenCalled();
+  });
+  // Exercises: sequential EOA batches wait for intermediate transactions before broadcasting the next plan.
+  it('sends EOA plan batches sequentially and waits between transactions', async () => {
+    const { divigent, writeContract, waitForTransactionReceipt } = createDivigentWithClients({
+      allowance: usdc('0.002') + 1n,
+      writeHashes: [HASH_1, HASH_2],
+    });
+    const first = await divigent.planApproveUsdc(usdc('0.001'));
+    const second = await divigent.planApproveUsdc(usdc('0.002'));
+
+    await expect(divigent.sendPlans([first, second], { confirmations: 2 }))
+      .resolves.toEqual({
+        mode: 'sequential',
+        txHashes: [HASH_1, HASH_2],
+      });
+
+    expect(writeContract).toHaveBeenCalledTimes(2);
+    expect(waitForTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(waitForTransactionReceipt).toHaveBeenCalledWith({
+      hash: HASH_1,
+      confirmations: 2,
+    });
+  });
+  // Exercises: approval-backed deposits batch approve + deposit for smart account executors.
+  it('batches approve and deposit for executor-backed approval deposits', async () => {
+    const { publicClient, readContract, writeContract } = createMockClients({
+      allowance: 0n,
+      previewDeposit: 1_000_000n,
+    });
+    const executeCalls = vi.fn(async () => ({ txHash: HASH_3 }));
+    const divigent = Divigent.create({
+      publicClient,
+      executor: {
+        account: OWNER,
+        kind: 'custom',
+        executeCalls,
+      },
+      chain: 'base-sepolia',
+      addresses,
+    });
+
+    await expect(divigent.depositWithApproval({ amount: usdc('0.001') }))
+      .resolves.toBe(HASH_3);
+
+    expect(writeContract).not.toHaveBeenCalled();
+    expect(executeCalls).toHaveBeenCalledWith(
+      [
+        expect.objectContaining({
+          to: addresses.usdc,
+          data: expect.stringMatching(/^0x095ea7b3/),
+        }),
+        expect.objectContaining({
+          to: addresses.router,
+          data: expect.stringMatching(/^0xbc157ac1/),
+        }),
+      ],
+      expect.any(Object),
+    );
+    expect(readContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'allowance',
+      args: [OWNER, addresses.router],
+    }));
+  });
+  // Exercises: executor deposits do not approve again when the smart account allowance is already deposit-safe.
+  it('skips executor approval when allowance already covers the buffered deposit', async () => {
+    const amount = usdc('0.001');
+    const { publicClient } = createMockClients({
+      allowance: amount + 1n,
+      previewDeposit: 1_000_000n,
+    });
+    const executeCalls = vi.fn(async () => ({ txHash: HASH_2 }));
+    const divigent = Divigent.create({
+      publicClient,
+      executor: {
+        account: OWNER,
+        kind: 'custom',
+        executeCalls,
+      },
+      chain: 'base-sepolia',
+      addresses,
+    });
+
+    await divigent.depositWithApproval({ amount });
+
+    expect(executeCalls).toHaveBeenCalledWith(
+      [expect.objectContaining({ to: addresses.router })],
+      expect.any(Object),
+    );
+  });
+  // Exercises: executor-backed deposits cannot approve one account while funding another wallet.
+  it('rejects executor approval deposits for a different funding wallet', async () => {
+    const { publicClient } = createMockClients();
+    const divigent = Divigent.create({
+      publicClient,
+      executor: {
+        account: OWNER,
+        kind: 'custom',
+        executeCalls: vi.fn(async () => ({ txHash: HASH_1 })),
+      },
+      chain: 'base-sepolia',
+      addresses,
+    });
+
+    await expect(divigent.depositWithApproval({
+      amount: usdc('0.001'),
+      wallet: SECOND_OWNER,
+    })).rejects.toMatchObject({
+      code: 'DIVIGENT_EXECUTOR_WALLET_MISMATCH',
+    });
+  });
   // Exercises: plans deposit approval requirement and skips deposit simulation when allowance is short.
   it('plans deposit approval requirement and skips deposit simulation when allowance is short', async () => {
     const { divigent, simulateContract } = createDivigentWithClients({
@@ -605,5 +839,334 @@ describe('transaction planning', () => {
       functionName: 'withdraw',
       args: [1_000n, OWNER, applySlippageDown(usdc('2'), 25)],
     }));
+  });
+});
+
+describe('liquidity intelligence helpers', () => {
+  // Exercises: returns an explainable read-only liquidity decision without moving funds.
+  it('assesses reserve, deployable excess, venue, and health from policy context', async () => {
+    const { divigent } = createDivigentWithClients({
+      usdcBalance: usdc('100'),
+      position: [usdc('20'), usdc('20'), 0n],
+      minDeposit: usdc('10'),
+      recommendedRoute: 1,
+    });
+
+    const assessment = await divigent.assessLiquidity({
+      pendingPaymentAmount: usdc('5'),
+      includeVenueHealth: true,
+      policyContext: {
+        minOperatingBalance: usdc('10'),
+        upcomingKnownPayouts: usdc('20'),
+        recentPaymentEma: usdc('50'),
+        reserveRatio: 0.2,
+        reserveMultiplier: 1,
+        riskPreference: 'conservative',
+      },
+    });
+
+    expect(assessment).toMatchObject({
+      wallet: OWNER,
+      riskPreference: 'conservative',
+      paymentReady: true,
+      canBecomePaymentReady: true,
+      reserveHealthy: true,
+      liquidityStatus: 'healthy',
+      pendingPaymentAmount: usdc('5'),
+      walletBalance: usdc('100'),
+      positionCurrentValue: usdc('20'),
+      minOperatingBalance: usdc('10'),
+      knownUpcomingOutflows: usdc('20'),
+      upcomingKnownPayouts: usdc('20'),
+      adaptiveReserve: usdc('10'),
+      requiredReserve: usdc('45'),
+      targetLiquidBalance: usdc('50'),
+      maxDeployableAmount: usdc('50'),
+      deployableExcess: usdc('50'),
+      recommendedDeploymentAmount: usdc('50'),
+      recallRequired: false,
+      recommendedRecallAmount: 0n,
+      preferredVenue: 'MORPHO',
+      venueHealth: expect.objectContaining({
+        status: 'healthy',
+        oracleFresh: true,
+      }),
+    });
+  });
+
+  // Exercises: recalls through the existing withdraw path when assessment says liquidity is short.
+  it('ensures payment readiness by recalling the assessed deficit', async () => {
+    const { divigent } = createDivigentWithClients({
+      usdcBalance: usdc('1'),
+      position: [usdc('20'), usdc('20'), 0n],
+      previewWithdrawNet: 42n,
+    });
+    const withdrawAndWait = vi.spyOn(divigent, 'withdrawAndWait').mockResolvedValue({
+      txHash: HASH_1,
+      usdcReturned: usdc('5'),
+    });
+
+    const result = await divigent.ensurePaymentReady({
+      pendingPayment: { amount: usdc('5') },
+      policyContext: {
+        minOperatingBalance: usdc('1'),
+        riskPreference: 'balanced',
+      },
+      slippageBps: 25,
+      confirmations: 2,
+    });
+
+    expect(result).toMatchObject({
+      recallTxHash: HASH_1,
+      usdcReturned: usdc('5'),
+      assessment: expect.objectContaining({
+        paymentReady: false,
+        canBecomePaymentReady: true,
+        liquidityStatus: 'needs_recall',
+        recommendedRecallAmount: usdc('5'),
+        executableRecallAmount: usdc('5'),
+        recallCoversTarget: true,
+        recommendedRecallShares: 42n,
+        recommendedAction: 'recall',
+      }),
+    });
+    expect(withdrawAndWait).toHaveBeenCalledWith(expect.objectContaining({
+      shares: 42n,
+      wallet: OWNER,
+      slippageBps: 25,
+      confirmations: 2,
+    }));
+  });
+
+  // Exercises: distinguishes payment-only recall from a full reserve-restoring recall.
+  it('marks recall as partial when the position can cover payment but not the full reserve target', async () => {
+    const { divigent } = createDivigentWithClients({
+      usdcBalance: usdc('1'),
+      position: [usdc('4.1'), usdc('4.1'), 0n],
+      previewWithdrawNet: 99n,
+    });
+    const withdrawAndWait = vi.spyOn(divigent, 'withdrawAndWait').mockResolvedValue({
+      txHash: HASH_1,
+      usdcReturned: usdc('4'),
+    });
+
+    const result = await divigent.ensurePaymentReady({
+      pendingPaymentAmount: usdc('5'),
+      minOperatingBalance: usdc('1'),
+    });
+
+    expect(result).toMatchObject({
+      recallTxHash: HASH_1,
+      usdcReturned: usdc('4'),
+      assessment: expect.objectContaining({
+        paymentReady: false,
+        canBecomePaymentReady: true,
+        liquidityStatus: 'partial_recall_only',
+        recommendedRecallAmount: usdc('5'),
+        executableRecallAmount: usdc('4.020101'),
+        executableRecallNetAmount: usdc('4'),
+        recallCoversTarget: false,
+        recallUnavailableCode: 'position_insufficient',
+        recommendedRecallShares: 99n,
+        recommendedAction: 'recall',
+      }),
+    });
+    expect(withdrawAndWait).toHaveBeenCalledWith(expect.objectContaining({
+      shares: 99n,
+      wallet: OWNER,
+    }));
+  });
+
+  // Exercises: refuses to report payment-ready when deployed liquidity cannot cover the payment.
+  it('reports insufficient liquidity when partial recall cannot satisfy the payment amount', async () => {
+    const { divigent } = createDivigentWithClients({
+      usdcBalance: usdc('1'),
+      position: [usdc('3'), usdc('3'), 0n],
+    });
+
+    await expect(divigent.ensurePaymentReady({
+      pendingPaymentAmount: usdc('5'),
+      minOperatingBalance: usdc('1'),
+    })).rejects.toMatchObject({
+      code: 'DIVIGENT_LIQUIDITY_RECALL_UNAVAILABLE',
+      context: expect.objectContaining({
+        recallUnavailableCode: 'position_insufficient',
+        recallUnavailableReason: 'deployed Divigent position cannot fully satisfy the target reserve',
+      }),
+    });
+
+    const assessment = await divigent.assessLiquidity({
+      pendingPaymentAmount: usdc('5'),
+      minOperatingBalance: usdc('1'),
+    });
+
+    expect(assessment).toMatchObject({
+      canBecomePaymentReady: false,
+      liquidityStatus: 'insufficient_liquidity',
+      recallUnavailableCode: 'position_insufficient',
+      recommendedAction: 'insufficient_liquidity',
+    });
+  });
+
+  // Exercises: treats reserve-only shortfalls as non-blocking when the payment amount is already liquid.
+  it('does not throw when only the reserve is low and no recall is available', async () => {
+    const { divigent } = createDivigentWithClients({
+      usdcBalance: usdc('5'),
+      position: [0n, 0n, 0n],
+    });
+
+    await expect(divigent.ensurePaymentReady({
+      pendingPaymentAmount: usdc('4'),
+      minOperatingBalance: usdc('2'),
+    })).resolves.toMatchObject({
+      assessment: expect.objectContaining({
+        paymentReady: true,
+        reserveHealthy: false,
+        liquidityStatus: 'reserve_low',
+        recallRequired: true,
+        recommendedAction: 'none',
+      }),
+    });
+  });
+
+  // Exercises: payment-ready callers can keep reserve top-ups off the critical path.
+  it('skips reserve-only top-up by default when the payment is already liquid', async () => {
+    const { divigent } = createDivigentWithClients({
+      usdcBalance: usdc('5'),
+      position: [usdc('20'), usdc('20'), 0n],
+      previewWithdrawNet: 42n,
+    });
+    const withdrawAndWait = vi.spyOn(divigent, 'withdrawAndWait').mockResolvedValue({
+      txHash: HASH_1,
+      usdcReturned: usdc('2'),
+    });
+
+    await expect(divigent.ensurePaymentReady({
+      pendingPaymentAmount: usdc('4'),
+      minOperatingBalance: usdc('3'),
+    })).resolves.toMatchObject({
+      assessment: expect.objectContaining({
+        paymentReady: true,
+        liquidityStatus: 'reserve_low',
+        recommendedAction: 'recall',
+      }),
+    });
+    expect(withdrawAndWait).not.toHaveBeenCalled();
+  });
+
+  // Exercises: reserve top-up can be opted into when the caller wants the full target restored.
+  it('recalls reserve-only shortfalls when reserveTopUp is opportunistic', async () => {
+    const { divigent } = createDivigentWithClients({
+      usdcBalance: usdc('5'),
+      position: [usdc('20'), usdc('20'), 0n],
+      previewWithdrawNet: 42n,
+    });
+    const withdrawAndWait = vi.spyOn(divigent, 'withdrawAndWait').mockResolvedValue({
+      txHash: HASH_1,
+      usdcReturned: usdc('2'),
+    });
+
+    await expect(divigent.ensurePaymentReady({
+      pendingPaymentAmount: usdc('4'),
+      minOperatingBalance: usdc('3'),
+      reserveTopUp: 'opportunistic',
+    })).resolves.toMatchObject({
+      recallTxHash: HASH_1,
+      assessment: expect.objectContaining({
+        paymentReady: true,
+        liquidityStatus: 'reserve_low',
+        recommendedAction: 'recall',
+      }),
+    });
+    expect(withdrawAndWait).toHaveBeenCalledWith(expect.objectContaining({
+      shares: 42n,
+      wallet: OWNER,
+    }));
+  });
+
+  // Exercises: balanced preserves the computed reserve, while capital-efficient can reduce adaptive reserve only.
+  it('applies balanced and capital-efficient risk profile reserve math', async () => {
+    const { divigent } = createDivigentWithClients({ usdcBalance: usdc('100') });
+
+    await expect(divigent.assessLiquidity({
+      minOperatingBalance: usdc('10'),
+      recentPaymentEma: usdc('100'),
+      reserveRatio: 0.2,
+      reserveMultiplier: 1,
+      riskPreference: 'balanced',
+    })).resolves.toMatchObject({
+      requiredReserve: usdc('20'),
+      recommendedDeploymentAmount: usdc('80'),
+      recommendedAction: 'deploy',
+    });
+
+    await expect(divigent.assessLiquidity({
+      minOperatingBalance: usdc('10'),
+      recentPaymentEma: usdc('100'),
+      reserveRatio: 0.2,
+      reserveMultiplier: 1,
+      riskPreference: 'capital-efficient',
+    })).resolves.toMatchObject({
+      requiredReserve: usdc('15'),
+      recommendedDeploymentAmount: usdc('85'),
+      recommendedAction: 'deploy',
+    });
+  });
+
+  // Exercises: route failures do not leave a positive deploy recommendation behind.
+  it('zeros recommended deployment when no deposit route is available', async () => {
+    const { divigent } = createDivigentWithClients({
+      usdcBalance: usdc('100'),
+      minDeposit: usdc('10'),
+    });
+    vi.spyOn(divigent, 'getRecommendedRoute').mockRejectedValue(new Error('no safe route'));
+
+    await expect(divigent.assessLiquidity()).resolves.toMatchObject({
+      deployableExcess: usdc('90'),
+      recommendedDeploymentAmount: 0n,
+      recommendedAction: 'none',
+      venueUnavailableReason: 'no safe route',
+    });
+  });
+
+  // Exercises: venue health reflects stale oracle / venue-rate safety without changing balances.
+  it('reports degraded venue health when oracle or venue data is unsafe', async () => {
+    const { divigent } = createDivigentWithClients();
+    vi.spyOn(divigent, 'oracleStatus').mockResolvedValue({
+      lastObservationTime: 1n,
+      fresh: false,
+    });
+
+    await expect(divigent.assessLiquidity({
+      includeVenueHealth: true,
+    })).resolves.toMatchObject({
+      venueHealth: expect.objectContaining({
+        status: 'degraded',
+        oracleFresh: false,
+      }),
+    });
+  });
+
+  // Exercises: validates liquidity policy percentages before making route decisions.
+  it('rejects invalid liquidity policy percentages', async () => {
+    const { divigent } = createDivigentWithClients();
+
+    await expect(divigent.assessLiquidity({
+      maxDeployablePercent: 101,
+    })).rejects.toMatchObject({
+      code: 'DIVIGENT_INVALID_LIQUIDITY_POLICY',
+    });
+  });
+
+  // Exercises: avoids ambiguous treasury input when both payout aliases are supplied.
+  it('rejects conflicting upcoming payout aliases', async () => {
+    const { divigent } = createDivigentWithClients();
+
+    await expect(divigent.assessLiquidity({
+      knownUpcomingOutflows: usdc('1'),
+      upcomingKnownPayouts: usdc('2'),
+    })).rejects.toMatchObject({
+      code: 'DIVIGENT_INVALID_LIQUIDITY_POLICY',
+    });
   });
 });

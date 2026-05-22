@@ -3,19 +3,44 @@
 export { Divigent } from './divigent';
 export type {
   ApproveUsdcPlan,
+  AssessLiquidityParams,
+  DepositWithApprovalParams,
   DepositParams,
   DepositPlan,
   DepositWithPermitParams,
   DivigentConfig,
   DivigentTransactionPlan,
   DivigentWriteRequest,
+  EnsurePaymentReadyParams,
+  EnsurePaymentReadyResult,
   EnsureInitializedParams,
+  LiquidityAction,
+  LiquidityAssessment,
+  LiquidityPolicyContext,
+  LiquidityRecommendedAction,
+  LiquidityRecallUnavailableCode,
+  LiquidityRiskPreference,
+  LiquidityStatus,
+  LiquidityVenueHealth,
+  PendingPaymentInput,
   SetOperatorParams,
   SignInitializeForParams,
   SignPermitParams,
   WithdrawPlan,
   WithdrawParams,
 } from './divigent';
+export {
+  createEip5792Executor,
+} from './execution';
+export type {
+  DivigentCall,
+  DivigentCallExecutor,
+  DivigentExecutionContext,
+  DivigentExecutionHandle,
+  DivigentExecutionReceipt,
+  DivigentSendPlansResult,
+  Eip5792ExecutorConfig,
+} from './execution';
 
 // Chains and address registry
 
@@ -30,8 +55,10 @@ export {
 } from './core/chains';
 export type {
   ChainConfig,
+  ContractAddressOverrides,
   ContractAddresses,
   DivigentChain,
+  LegacyContractAddresses,
 } from './core/chains';
 
 // Shared types

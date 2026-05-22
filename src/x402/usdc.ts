@@ -1,6 +1,11 @@
 import { getAddresses, type DivigentChain } from '../core/chains';
 import type { EvmAddress, Prettify } from '../types';
 
+/**
+ * @notice x402 transfer method advertised for a USDC payment requirement.
+ * @remarks Base mainnet Circle USDC uses EIP-3009; the Base Sepolia demo token
+ * path uses permit2 metadata.
+ */
 export type X402AssetTransferMethod = 'eip3009' | 'permit2';
 
 /** @notice x402 token metadata required by common USDC settlement paths. */
@@ -15,8 +20,11 @@ export type X402UsdcExtra = Prettify<{
 
 /** @notice x402 price object for a Divigent-supported USDC asset. */
 export type X402UsdcPrice = Prettify<{
+  /** @notice Atomic USDC amount as a decimal string, matching x402's price shape. */
   readonly amount: string;
+  /** @notice USDC contract address for the selected chain. */
   readonly asset: EvmAddress;
+  /** @notice Token metadata required by the facilitator/scheme implementation. */
   readonly extra: X402UsdcExtra;
 }>;
 

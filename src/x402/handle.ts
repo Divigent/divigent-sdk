@@ -1,6 +1,6 @@
 import type { x402Client } from '@x402/core/client';
 import type { x402ResourceServer } from '@x402/core/server';
-import type { Divigent } from '../divigent';
+import type { AssessLiquidityParams, Divigent } from '../divigent';
 import type { TxHash } from '../types';
 import { attachX402HooksWithReserveFloor, ReserveFloor } from './attach';
 import { attachDivigentIncome, depositIdleAboveFloor, wrapFetchWithDivigentYield } from './settlement';
@@ -13,6 +13,9 @@ import type {
   X402WrapConfig,
 } from './types';
 
+// Shared reserve knobs used by both buyer-side recall hooks and seller-side
+// income sweeps. Keeping this small lets both handles share the same reserve
+// floor implementation without depending on unrelated x402 policy fields.
 type ReserveFloorConfig = Pick<X402WrapConfig, 'minIdleThreshold' | 'reserveRatio' | 'reserveMultiplier'>;
 
 function reserveFloor(config: ReserveFloorConfig): ReserveFloor {
@@ -23,12 +26,47 @@ function reserveFloor(config: ReserveFloorConfig): ReserveFloor {
   });
 }
 
+// The router MIN_DEPOSIT is stable during a process lifetime, so wrapper helpers
+// cache it and reuse the value for idle-sweep dust checks.
 function createProtocolMinDeposit(divigent: Divigent): () => Promise<bigint> {
   let minDepositPromise: Promise<bigint> | undefined;
   return () => {
     minDepositPromise ??= divigent.minDeposit();
     return minDepositPromise;
   };
+}
+
+// Bridge the x402 hook's observed reserve floor into the public liquidity
+// intelligence API. This is what lets `handle.assessLiquidity()` include the
+// same EMA that the hook learned from recent payments.
+function assessWithReserveFloor(
+  divigent: Divigent,
+  floor: ReserveFloor,
+  config: ReserveFloorConfig & { wallet?: AssessLiquidityParams['wallet'] },
+  options: AssessLiquidityParams = {},
+) {
+  const params: AssessLiquidityParams = {
+    ...options,
+    minOperatingBalance: options.minOperatingBalance ??
+      options.policyContext?.minOperatingBalance ??
+      floor.minimum,
+    recentPaymentEma: options.recentPaymentEma ??
+      options.policyContext?.recentPaymentEma ??
+      floor.ema,
+  };
+  const wallet = options.wallet ?? config.wallet;
+  const reserveRatio = options.reserveRatio ??
+    options.policyContext?.reserveRatio ??
+    config.reserveRatio;
+  const reserveMultiplier = options.reserveMultiplier ??
+    options.policyContext?.reserveMultiplier ??
+    config.reserveMultiplier;
+
+  if (wallet !== undefined) params.wallet = wallet;
+  if (reserveRatio !== undefined) params.reserveRatio = reserveRatio;
+  if (reserveMultiplier !== undefined) params.reserveMultiplier = reserveMultiplier;
+
+  return divigent.assessLiquidity(params);
 }
 
 function withProtocolMinDeposit<T extends {
@@ -66,6 +104,7 @@ export function createX402AttachHandle(
 
   return {
     detach: hookHandle.detach,
+    assessLiquidity: (options = {}) => assessWithReserveFloor(divigent, floor, config, options),
     wrapFetchWithYield: (fetchWithPayment, http, options = {}) => (
       wrapFetchWithDivigentYield(fetchWithPayment, http, divigent, floor, {
         ...withProtocolMinDeposit(minDeposit, options, config.onNonFatalError),
@@ -113,6 +152,7 @@ export function createX402IncomeAttachHandle(
 
   return {
     detach: incomeHandle.detach,
+    assessLiquidity: (options = {}) => assessWithReserveFloor(divigent, floor, config, options),
     depositIdle: (options = {}) => (
       depositIdleAboveFloor(
         divigent,

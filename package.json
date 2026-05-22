@@ -1,6 +1,6 @@
 {
   "name": "@divigent/sdk",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Viem-native TypeScript SDK for Divigent on Base and Base Sepolia",
   "license": "MIT",
   "author": "Divigent Protocol",
@@ -52,7 +52,7 @@
     "tsup": "^8.3.0",
     "tsx": "^4.21.0",
     "typescript": "^5.5.0",
-    "viem": "^2.21.0",
+    "viem": "^2.50.4",
     "vitest": "^4.1.5"
   },
   "engines": {

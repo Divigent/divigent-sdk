@@ -208,6 +208,36 @@ async function spawnAnvilFork(args: ForkArgs): Promise<{
     };
   }
 
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await spawnAnvilForkOnce(args);
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableAnvilStartupError(err)) break;
+      await delay(1_000 * (attempt + 1));
+    }
+  }
+  throw lastError;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, ms);
+  });
+}
+
+function isRetryableAnvilStartupError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes('Anvil exited before listening') ||
+    message.includes('Timed out waiting for Anvil fork to start');
+}
+
+function spawnAnvilForkOnce(args: ForkArgs): Promise<{
+  rpcUrl: `http://127.0.0.1:${number}`;
+  spawned: boolean;
+  stop: () => void;
+}> {
   let started = false;
   let stderr = '';
   let stdout = '';
@@ -334,7 +364,7 @@ function oracleConstructorArgs(artifact: ForgeArtifact): readonly unknown[] {
     baseDependencies.aavePool,
     baseDependencies.aToken,
     baseDependencies.usdc,
-    baseDependencies.steakhouseUSDCPrimeVault,
+    baseDependencies.steakhouseUSDCVault,
   ] as const;
 
   const inputCount = constructorInputCount(artifact);
@@ -426,7 +456,7 @@ async function deployDivigentStackOnFork(params: {
       baseDependencies.usdc,
       baseDependencies.aavePool,
       baseDependencies.aToken,
-      baseDependencies.steakhouseUSDCPrimeVault,
+      baseDependencies.steakhouseUSDCVault,
       oracle,
       feeCollector,
       dvUsdc,
@@ -490,7 +520,7 @@ export async function assertBaseForkDependencyWiring(params: {
     usdc: addresses.usdc,
     aavePool: addresses.aavePool,
     aaveAToken: addresses.aToken,
-    morphoVault: addresses.steakhouseUSDCPrimeVault,
+    morphoVault: addresses.steakhouseUSDCVault,
   };
   assertAddress('Base USDC', expected.usdc, REAL_BASE_FORK_DEPENDENCIES.usdc);
   assertAddress('Base Aave pool', expected.aavePool, REAL_BASE_FORK_DEPENDENCIES.aavePool);
@@ -549,7 +579,7 @@ export async function assertBaseForkDependencyWiring(params: {
       functionName: 'MORPHO_VAULT',
     }),
     publicClient.readContract({
-      address: addresses.steakhouseUSDCPrimeVault,
+      address: addresses.steakhouseUSDCVault,
       abi: morphoVaultAssetAbi,
       functionName: 'asset',
     }),

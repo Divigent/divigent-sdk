@@ -29,7 +29,21 @@ import type {
   X402WrapConfig,
 } from './types';
 
-export const DEFAULT_MAX_PAYMENT_AMOUNT = 100n * 10n ** 6n; // 100 USDC
+/**
+ * Default per-payment safety cap for x402 buyer hooks: 100 USDC.
+ *
+ * Integrators should usually set a tighter `maxPaymentAmount` for production
+ * agents. This default prevents an unconfigured hook from recalling liquidity
+ * for very large payment requests.
+ */
+export const DEFAULT_MAX_PAYMENT_AMOUNT = 100n * 10n ** 6n;
+
+// Payment-time recalls use a wider slippage guard than manual withdrawals so a
+// tiny PPS move does not break an otherwise valid x402 payment.
+const PAYMENT_PATH_SLIPPAGE_BPS = 50;
+
+// After a recall withdrawal, wait for the USDC balance read to show the funds
+// before letting x402 sign. This avoids signing against stale RPC state.
 const RECALL_BALANCE_TIMEOUT_MS = 60_000;
 const RECALL_BALANCE_POLL_MS = 2_000;
 
@@ -84,6 +98,11 @@ export class ReserveFloor {
   get ema(): bigint {
     return this.emaScaled;
   }
+
+  /** @notice Minimum liquid reserve configured for this reserve floor. */
+  get minimum(): bigint {
+    return this.minIdleThreshold;
+  }
 }
 
 /**
@@ -128,7 +147,7 @@ export function attachX402HooksWithReserveFloor(
   }
   attachedClients.add(client);
 
-  const slippageBps = config.slippageBps ?? 50;
+  const slippageBps = config.slippageBps ?? PAYMENT_PATH_SLIPPAGE_BPS;
   const expectedNetwork = `eip155:${CHAINS[divigent.chain].id}`;
   const expectedAsset = divigent.addresses.usdc.toLowerCase();
 
@@ -385,10 +404,12 @@ export function attachX402HooksWithReserveFloor(
           if (excess > 0n) {
             try {
               redepositAmount = excess;
-              redepositTxHash = await divigent.depositWithPermit({
-                amount: excess,
-                wallet: state.owner,
-              });
+              redepositTxHash = divigent.executor
+                ? await divigent.depositWithApproval({ amount: excess, wallet: state.owner })
+                : await divigent.depositWithPermit({
+                  amount: excess,
+                  wallet: state.owner,
+                });
             } catch (_err) {
               // Redeposit failed; USDC remains liquid in the wallet.
               await reportNonFatal(config.onNonFatalError, {

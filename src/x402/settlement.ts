@@ -159,8 +159,12 @@ export async function depositIdleAboveFloor(
   reserveFloor: ReserveFloor,
   options: DepositIdleOptions = {},
 ): Promise<TxHash | undefined> {
+  // Explicit wallet wins; otherwise smart-account sweeps should use the
+  // executor account, and EOA sweeps fall back to the bound wallet client.
   const wallet =
-    options.wallet ?? (divigent.walletClient?.account?.address as EvmAddress | undefined);
+    options.wallet ??
+    divigent.executor?.account ??
+    (divigent.walletClient?.account?.address as EvmAddress | undefined);
   if (!wallet) return undefined;
 
   if (options.dedupeKey && options.seenTxHashes?.has(options.dedupeKey)) return undefined;
@@ -178,11 +182,13 @@ export async function depositIdleAboveFloor(
     const min = await resolveMinDeposit(options.minDeposit);
     if (idle < min) return undefined;
 
-    const result = await divigent.depositWithPermitAndWait({
-      amount: idle,
-      wallet,
-      fallbackOnPermitUnsupported: true,
-    });
+    const result = divigent.executor
+      ? await divigent.depositWithApprovalAndWait({ amount: idle, wallet })
+      : await divigent.depositWithPermitAndWait({
+        amount: idle,
+        wallet,
+        fallbackOnPermitUnsupported: true,
+      });
     const txHash = result.txHash;
     if (options.dedupeKey) options.seenTxHashes?.add(options.dedupeKey);
     if (options.onIdleDeposit) {

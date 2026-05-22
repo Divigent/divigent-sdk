@@ -10,3 +10,4 @@ gitbook/
 .env
 .env.*
 !.env.example
+pocs/

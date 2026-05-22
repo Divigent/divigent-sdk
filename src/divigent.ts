@@ -1,10 +1,11 @@
 import type { PublicClient, WalletClient, WriteContractParameters } from 'viem';
-import { getAddress, isAddress } from 'viem';
+import { encodeFunctionData, getAddress, isAddress } from 'viem';
 import { routerAbi, usdcAbi } from './abis';
 import {
   CHAINS,
   assertProtocolDeployed,
   chainFromId,
+  type ContractAddressOverrides,
   type ContractAddresses,
   type DivigentChain,
   getAddresses,
@@ -24,6 +25,12 @@ import {
 } from './errors';
 import { txHash } from './types';
 import type {
+  DivigentCall,
+  DivigentCallExecutor,
+  DivigentExecutionContext,
+  DivigentSendPlansResult,
+} from './execution';
+import type {
   EvmAddress,
   DepositResult,
   OptimalVault,
@@ -42,7 +49,7 @@ import type {
 } from './types';
 import type { x402Client } from '@x402/core/client';
 import type { x402ResourceServer } from '@x402/core/server';
-import { applySlippageDown } from './core/utils';
+import { applyBps, applySlippageDown, bigintMax, bigintMin } from './core/utils';
 import {
   createX402AttachHandle,
   createX402IncomeAttachHandle,
@@ -56,6 +63,7 @@ import type {
   X402IncomeConfig,
   X402WrapConfig,
 } from './x402/types';
+import { withOwnerLock } from './x402/locks';
 import { parseDepositReceipt, parseWithdrawReceipt } from './core/receipts';
 import {
   approveUsdc,
@@ -121,7 +129,7 @@ import {
 } from './contracts/divigentVaultRouter';
 
 // Construction-time address validation.
-const ADDRESS_FIELDS: ReadonlyArray<keyof ContractAddresses> = [
+const ADDRESS_FIELDS = [
   'router',
   'oracle',
   'feeCollector',
@@ -129,13 +137,44 @@ const ADDRESS_FIELDS: ReadonlyArray<keyof ContractAddresses> = [
   'usdc',
   'aavePool',
   'aToken',
-  'steakhouseUSDCPrimeVault',
-];
+  'steakhouseUSDCVault',
+] as const satisfies ReadonlyArray<keyof ContractAddresses>;
 
-function validateOverrideAddresses(input: ContractAddresses): ContractAddresses {
-  const out = {} as Record<keyof ContractAddresses, EvmAddress>;
+function normalizeOverrideAddresses(input: ContractAddressOverrides): ContractAddresses {
+  const vault = input.steakhouseUSDCVault ?? input.steakhouseUSDCPrimeVault;
+  if (
+    input.steakhouseUSDCVault !== undefined &&
+    input.steakhouseUSDCPrimeVault !== undefined &&
+    isAddress(input.steakhouseUSDCVault) &&
+    isAddress(input.steakhouseUSDCPrimeVault) &&
+    getAddress(input.steakhouseUSDCVault) !== getAddress(input.steakhouseUSDCPrimeVault)
+  ) {
+    throw new DivigentError(
+      '[@divigent/sdk] steakhouseUSDCVault and steakhouseUSDCPrimeVault overrides must match',
+      {
+        code: 'DIVIGENT_INVALID_ADDRESS',
+        category: 'validation',
+        context: {
+          field: 'DivigentConfig.addresses.steakhouseUSDCPrimeVault',
+          value: input.steakhouseUSDCPrimeVault,
+        },
+      },
+    );
+  }
+  return {
+    ...input,
+    steakhouseUSDCVault: vault as EvmAddress,
+    ...(input.steakhouseUSDCPrimeVault !== undefined && {
+      steakhouseUSDCPrimeVault: input.steakhouseUSDCPrimeVault,
+    }),
+  };
+}
+
+function validateOverrideAddresses(input: ContractAddressOverrides): ContractAddresses {
+  const normalized = normalizeOverrideAddresses(input);
+  const out = {} as Record<(typeof ADDRESS_FIELDS)[number], EvmAddress>;
   for (const field of ADDRESS_FIELDS) {
-    const raw = input[field] as string;
+    const raw = normalized[field] as string;
     if (typeof raw !== 'string' || !isAddress(raw)) {
       throw new DivigentError(
         `[@divigent/sdk] DivigentConfig.addresses.${field} is not a valid EVM address: ${JSON.stringify(raw)}`,
@@ -153,15 +192,44 @@ function validateOverrideAddresses(input: ContractAddresses): ContractAddresses 
     }
     out[field] = getAddress(raw) as EvmAddress;
   }
-  return out;
+  let legacyVault: EvmAddress | undefined;
+  if (normalized.steakhouseUSDCPrimeVault !== undefined) {
+    const raw = normalized.steakhouseUSDCPrimeVault;
+    if (typeof raw !== 'string' || !isAddress(raw)) {
+      throw new DivigentError(
+        `[@divigent/sdk] DivigentConfig.addresses.steakhouseUSDCPrimeVault is not a valid EVM address: ${JSON.stringify(raw)}`,
+        {
+          code: 'DIVIGENT_INVALID_ADDRESS',
+          category: 'validation',
+          context: { field: 'DivigentConfig.addresses.steakhouseUSDCPrimeVault', value: raw },
+        },
+      );
+    }
+    if (isZeroAddress(raw as EvmAddress)) {
+      throw new ZeroAddressError({
+        context: { field: 'DivigentConfig.addresses.steakhouseUSDCPrimeVault' },
+      });
+    }
+    legacyVault = getAddress(raw) as EvmAddress;
+  }
+  return {
+    ...out,
+    ...(legacyVault !== undefined && { steakhouseUSDCPrimeVault: legacyVault }),
+  };
 }
 
 /** @notice Configuration for creating a Divigent SDK facade. */
 export type DivigentConfig = {
   /** @notice viem public client bound to the same chain as the Divigent deployment. */
   publicClient: PublicClient;
-  /** @notice viem wallet client required for writes, signing, and x402 recall hooks. */
+  /** @notice viem wallet client used for EOA writes, signing, and x402 recall hooks. */
   walletClient?: WalletClient | undefined;
+  /**
+   * @notice Optional smart-account or batched-wallet executor for write calls.
+   * @remarks When present, planning uses `executor.account` as the transaction
+   * sender and `sendPlan`/`sendPlans` route calls through the executor.
+   */
+  executor?: DivigentCallExecutor | undefined;
   /**
    * @notice Supported deployment chain.
    * @remarks If omitted, the SDK infers from bound viem client chains when possible,
@@ -169,7 +237,7 @@ export type DivigentConfig = {
    */
   chain?: DivigentChain | undefined;
   /** @notice Optional custom deployment addresses for private/test deployments. */
-  addresses?: ContractAddresses | undefined;
+  addresses?: ContractAddressOverrides | undefined;
 };
 
 /** @notice Parameters for granting or revoking operator authority. */
@@ -208,6 +276,9 @@ export type DepositWithPermitParams = DepositParams & {
   /** @deprecated Use `fallbackOnPermitUnsupported`. Kept for backwards compatibility. */
   fallbackOn7702?: boolean;
 };
+
+/** @notice Parameters for an approval-backed deposit. */
+export type DepositWithApprovalParams = DepositParams;
 
 /** @notice viem write request returned by Divigent transaction planning methods. */
 export type DivigentWriteRequest = WriteContractParameters;
@@ -293,12 +364,221 @@ export type EnsureInitializedParams = WaitOptions & {
   wallet?: EvmAddress;
 };
 
+/** @notice Liquidity posture preset. It changes reserve posture, not protocol venues. */
+export type LiquidityRiskPreference = 'conservative' | 'balanced' | 'capital-efficient';
+
+/** @notice Optional business context used by liquidity assessment helpers. */
+export type LiquidityPolicyContext = {
+  /** @notice Minimum USDC the wallet should keep liquid for normal operations. */
+  minOperatingBalance?: bigint;
+  /** @notice Sum of known upcoming USDC outflows, e.g. refunds, payouts, or scheduled spend. */
+  knownUpcomingOutflows?: bigint;
+  /** @notice Alias for known upcoming USDC payouts, matching agent treasury policy wording. */
+  upcomingKnownPayouts?: bigint;
+  /** @notice Maximum share of current wallet USDC that may be deployed, from 0 to 100. */
+  maxDeployablePercent?: number;
+  /** @notice Reserve posture preset. Defaults to `balanced`. */
+  riskPreference?: LiquidityRiskPreference;
+  /** @notice Optional recent-payment EMA in USDC atomic units for adaptive reserves. */
+  recentPaymentEma?: bigint;
+  /** @notice EMA reserve ratio. Defaults to the x402 hook default of 0.1. */
+  reserveRatio?: number;
+  /** @notice Multiplier applied to the EMA reserve. Defaults to the x402 hook default of 3. */
+  reserveMultiplier?: number;
+};
+
+/** @notice Pending payment input accepted by liquidity assessment helpers. */
+export type PendingPaymentInput = bigint | { amount: bigint };
+
+/** @notice Parameters for a read-only liquidity assessment. */
+export type AssessLiquidityParams = LiquidityPolicyContext & {
+  /** @notice Wallet to assess. Defaults to the bound wallet client or executor account. */
+  wallet?: EvmAddress;
+  /** @notice Pending payment amount, if any. */
+  pendingPayment?: PendingPaymentInput;
+  /** @notice Pending payment amount alias for callers that prefer a flat shape. */
+  pendingPaymentAmount?: bigint;
+  /** @notice Nested business context, useful for integrators that keep policy separate. */
+  policyContext?: LiquidityPolicyContext;
+  /** @notice Skip deployment recommendations below this amount. Defaults to router MIN_DEPOSIT. */
+  minDeposit?: bigint;
+  /** @notice Include oracle/capacity/allocation reads in the returned venue health. */
+  includeVenueHealth?: boolean;
+  /** @notice Slippage haircut used when judging whether a recall can fund a payment. */
+  recallSlippageBps?: number;
+};
+
+/** @notice Health snapshot for Divigent's approved venue set. */
+export type LiquidityVenueHealth = {
+  status: 'healthy' | 'degraded';
+  oracleFresh: boolean;
+  lastObservationTime: bigint;
+  withdrawCapacity: VaultCapacity;
+  allocation: VaultAllocation;
+  rates: readonly VaultRate[];
+};
+
+/** @notice High-level wallet liquidity state. */
+export type LiquidityStatus =
+  | 'healthy'
+  | 'reserve_low'
+  | 'partial_recall_only'
+  | 'needs_recall'
+  | 'insufficient_liquidity';
+
+/** @notice Machine-readable next action suggested by `assessLiquidity`. */
+export type LiquidityRecommendedAction =
+  | 'none'
+  | 'recall'
+  | 'deploy'
+  | 'insufficient_liquidity';
+
+/** @notice Non-mutually-exclusive action list for liquidity UIs. */
+export type LiquidityAction = 'recall' | 'deploy';
+
+/** @notice Machine-readable reason why full recall is unavailable. */
+export type LiquidityRecallUnavailableCode =
+  | 'no_position'
+  | 'position_insufficient'
+  | 'preview_failed';
+
+/** @notice Read-only decision returned by `assessLiquidity`. */
+export type LiquidityAssessment = Prettify<{
+  /** @notice Wallet that was assessed. */
+  wallet: EvmAddress;
+  /** @notice Reserve posture used for this decision. */
+  riskPreference: LiquidityRiskPreference;
+  /** @notice True when current wallet USDC can cover the pending payment. */
+  paymentReady: boolean;
+  /** @notice True when a Divigent recall can make the pending payment liquid after slippage. */
+  canBecomePaymentReady: boolean;
+  /** @notice True when wallet USDC already covers pending payment plus reserve. */
+  reserveHealthy: boolean;
+  /** @notice High-level liquidity state for dashboards and policy engines. */
+  liquidityStatus: LiquidityStatus;
+  /** @notice Pending payment amount included in the decision, if any. */
+  pendingPaymentAmount: bigint;
+  /** @notice Current wallet USDC balance. */
+  walletBalance: bigint;
+  /** @notice Current value of the wallet's deployed Divigent position. */
+  positionCurrentValue: bigint;
+  /** @notice Liquid USDC reserve required by business floors and adaptive policy. */
+  requiredReserve: bigint;
+  /** @notice Desired wallet USDC balance: pending payment plus required reserve. */
+  targetLiquidBalance: bigint;
+  /** @notice Hard operating floor supplied by the caller or policy context. */
+  minOperatingBalance: bigint;
+  /** @notice Sum of known upcoming outflows included in the hard reserve. */
+  knownUpcomingOutflows: bigint;
+  /** @notice Alias of known upcoming payout amount returned for treasury-policy UIs. */
+  upcomingKnownPayouts: bigint;
+  /** @notice EMA-based reserve component before risk-profile adjustment. */
+  adaptiveReserve: bigint;
+  /** @notice Maximum deployable wallet USDC allowed by `maxDeployablePercent`. */
+  maxDeployableAmount: bigint;
+  /** @notice Wallet USDC above the target liquid balance, after deploy cap. */
+  deployableExcess: bigint;
+  /** @notice Suggested deposit amount, or zero if below minDeposit or no route is available. */
+  recommendedDeploymentAmount: bigint;
+  /** @notice All applicable actions; callers that need complete UI state should prefer this. */
+  recommendedActions: readonly LiquidityAction[];
+  /**
+   * @notice Primary action for simple callers.
+   * @remarks Priority is `insufficient_liquidity`, then `recall`, then `deploy`, then `none`.
+   */
+  recommendedAction: LiquidityRecommendedAction;
+  /** @notice True when current wallet USDC is below the target liquid balance. */
+  recallRequired: boolean;
+  /** @notice Gross USDC amount the wallet should recall to reach the target. */
+  recommendedRecallAmount: bigint;
+  /** @notice Gross USDC amount the SDK can actually attempt to recall. */
+  executableRecallAmount: bigint;
+  /** @notice Slippage-haircut value expected from `executableRecallAmount`. */
+  executableRecallNetAmount: bigint;
+  /** @notice True when the executable recall can cover the full target reserve. */
+  recallCoversTarget: boolean;
+  /** @notice dvUSDC shares required for the suggested recall, if available. */
+  recommendedRecallShares?: bigint;
+  /** @notice Machine-readable reason a full recall is unavailable. */
+  recallUnavailableCode?: LiquidityRecallUnavailableCode;
+  /** @notice Venue Divigent would route the suggested deployment to. */
+  preferredVenue?: VaultType;
+  /** @notice Optional oracle, route, and withdrawal capacity health snapshot. */
+  venueHealth?: LiquidityVenueHealth;
+  /** @notice Human-readable recall issue, intended for logs and dashboards. */
+  recallUnavailableReason?: string;
+  /** @notice Human-readable deployment route issue, intended for logs and dashboards. */
+  venueUnavailableReason?: string;
+}>;
+
+/** @notice Parameters for recalling enough USDC to satisfy a liquidity assessment. */
+export type EnsurePaymentReadyParams = AssessLiquidityParams & WaitOptions & {
+  /** @notice Slippage guard for any recall withdrawal. */
+  slippageBps?: number;
+  /**
+   * @notice Whether reserve-only shortfalls should withdraw on the payment path.
+   * Defaults to `skip`, so already liquid payments are not delayed by reserve top-ups.
+   */
+  reserveTopUp?: 'skip' | 'opportunistic';
+  /** @notice Optional EIP-1559 fee overrides for any recall withdrawal. */
+  fees?: FeeOverrides;
+};
+
+/** @notice Result returned by `ensurePaymentReady`. */
+export type EnsurePaymentReadyResult = Prettify<{
+  assessment: LiquidityAssessment;
+  recallTxHash?: TxHash;
+  usdcReturned?: bigint;
+}>;
+
 // Stablecoin vault PPS drift is normally tiny; 10 bps is a tight default for
 // user-initiated exits. The x402 recall path uses a wider payment-safe margin.
 const DEFAULT_SLIPPAGE_BPS = 10;
+
+// Payment-time recalls tolerate a wider 50 bps buffer so small PPS movement
+// does not prevent an agent from completing an approved payment.
+const PAYMENT_PATH_SLIPPAGE_BPS = 50;
+
+// Approval writes can take a block or two before every RPC endpoint reflects
+// the new allowance. These bounds keep approval-backed deposits deterministic.
 const APPROVAL_VISIBILITY_TIMEOUT_MS = 60_000;
 const APPROVAL_VISIBILITY_POLL_MS = 2_000;
+
+// Used for max-allowance smart-account approvals and permit fallbacks.
 const MAX_UINT256 = (1n << 256n) - 1n;
+
+// Basis-points denominator used by the liquidity policy math.
+const BPS = 10_000n;
+
+type RiskProfile = {
+  reserveBps: bigint;
+  defaultMaxDeployableBps: bigint;
+};
+
+const RISK_PROFILES: Record<LiquidityRiskPreference, RiskProfile> = {
+  conservative: {
+    reserveBps: 15_000n,
+    defaultMaxDeployableBps: 5_000n,
+  },
+  balanced: {
+    reserveBps: 10_000n,
+    defaultMaxDeployableBps: 9_000n,
+  },
+  'capital-efficient': {
+    reserveBps: 7_500n,
+    defaultMaxDeployableBps: 10_000n,
+  },
+};
+
+type ResolvedLiquidityPolicy = {
+  minOperatingBalance: bigint;
+  knownUpcomingOutflows: bigint;
+  maxDeployableBps: bigint;
+  riskPreference: LiquidityRiskPreference;
+  recentPaymentEma: bigint;
+  reserveRatio: number;
+  reserveMultiplier: number;
+};
 
 function withFeeOverrides(
   request: unknown,
@@ -309,6 +589,160 @@ function withFeeOverrides(
 
 function sameAddress(a: EvmAddress, b: EvmAddress): boolean {
   return getAddress(a) === getAddress(b);
+}
+
+function assertNonNegativeAmount(name: string, amount: bigint): void {
+  if (amount < 0n) {
+    throw new DivigentError(`[@divigent/sdk] ${name} must be non-negative`, {
+      code: 'DIVIGENT_INVALID_LIQUIDITY_POLICY',
+      category: 'validation',
+      context: { field: name, amount },
+    });
+  }
+}
+
+function unknownMessage(value: unknown): string {
+  if (value instanceof Error) return value.message;
+  return String(value);
+}
+
+function applyBpsCeil(amount: bigint, bps: bigint): bigint {
+  if (amount === 0n || bps === 0n) return 0n;
+  return (amount * bps + BPS - 1n) / BPS;
+}
+
+function grossUpForSlippage(amount: bigint, bps: number | bigint): bigint {
+  if (amount === 0n) return 0n;
+  const bpsBI = typeof bps === 'bigint' ? bps : BigInt(bps);
+  if (bpsBI < 0n || bpsBI >= BPS) {
+    throw new DivigentError(`[@divigent/sdk] invalid recall slippage bps: ${bpsBI}`, {
+      code: 'DIVIGENT_INVALID_SLIPPAGE_BPS',
+      category: 'validation',
+      context: { bps: bpsBI },
+    });
+  }
+  const denominator = BPS - bpsBI;
+  return (amount * BPS + denominator - 1n) / denominator;
+}
+
+function venueSetReachable(withdrawCapacity: VaultCapacity, rates: readonly VaultRate[]): boolean {
+  return rates.every((rate) => {
+    if (rate.vaultType === 'MORPHO') return withdrawCapacity.morphoReachable;
+    return true;
+  });
+}
+
+function abiFunctionInputCount(abi: unknown, functionName: string): number | undefined {
+  if (!Array.isArray(abi)) return undefined;
+  const matches = abi.filter((item) => (
+    item !== null &&
+    typeof item === 'object' &&
+    (item as { type?: unknown }).type === 'function' &&
+    (item as { name?: unknown }).name === functionName
+  ));
+  if (matches.length !== 1) return undefined;
+  const inputs = (matches[0] as { inputs?: unknown }).inputs;
+  return Array.isArray(inputs) ? inputs.length : 0;
+}
+
+function percentToBps(name: string, value: number): bigint {
+  if (!Number.isFinite(value) || value < 0 || value > 100) {
+    throw new DivigentError(`[@divigent/sdk] ${name} must be between 0 and 100`, {
+      code: 'DIVIGENT_INVALID_LIQUIDITY_POLICY',
+      category: 'validation',
+      context: { field: name, value },
+    });
+  }
+  return BigInt(Math.round(value * 100));
+}
+
+function ratioToBps(name: string, value: number): bigint {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new DivigentError(`[@divigent/sdk] ${name} must be a non-negative finite number`, {
+      code: 'DIVIGENT_INVALID_LIQUIDITY_POLICY',
+      category: 'validation',
+      context: { field: name, value },
+    });
+  }
+  return BigInt(Math.round(value * 10_000));
+}
+
+function pendingPaymentAmount(params: AssessLiquidityParams): bigint {
+  if (params.pendingPaymentAmount !== undefined) return params.pendingPaymentAmount;
+  const pending = params.pendingPayment;
+  if (typeof pending === 'bigint') return pending;
+  return pending?.amount ?? 0n;
+}
+
+function normalizeRiskPreference(
+  value: LiquidityRiskPreference | undefined,
+): LiquidityRiskPreference {
+  const next = value ?? 'balanced';
+  if (!Object.prototype.hasOwnProperty.call(RISK_PROFILES, next)) {
+    throw new DivigentError(`[@divigent/sdk] unsupported liquidity riskPreference: ${String(next)}`, {
+      code: 'DIVIGENT_INVALID_LIQUIDITY_POLICY',
+      category: 'validation',
+      context: { field: 'riskPreference', value: next },
+    });
+  }
+  return next;
+}
+
+function policyValue<TKey extends keyof LiquidityPolicyContext>(
+  params: AssessLiquidityParams,
+  key: TKey,
+): LiquidityPolicyContext[TKey] | undefined {
+  return params[key] ?? params.policyContext?.[key];
+}
+
+function resolveUpcomingOutflows(params: AssessLiquidityParams): bigint {
+  const outflows = policyValue(params, 'knownUpcomingOutflows');
+  const payouts = policyValue(params, 'upcomingKnownPayouts');
+  if (outflows !== undefined && payouts !== undefined && outflows !== payouts) {
+    throw new DivigentError(
+      '[@divigent/sdk] knownUpcomingOutflows and upcomingKnownPayouts must match when both are provided',
+      {
+        code: 'DIVIGENT_INVALID_LIQUIDITY_POLICY',
+        category: 'validation',
+        context: { knownUpcomingOutflows: outflows, upcomingKnownPayouts: payouts },
+      },
+    );
+  }
+  return outflows ?? payouts ?? 0n;
+}
+
+function resolveLiquidityPolicy(params: AssessLiquidityParams): ResolvedLiquidityPolicy {
+  const riskPreference = normalizeRiskPreference(policyValue(params, 'riskPreference'));
+  const profile = RISK_PROFILES[riskPreference];
+  const maxDeployableBps = params.maxDeployablePercent !== undefined ||
+    params.policyContext?.maxDeployablePercent !== undefined
+    ? percentToBps(
+      'maxDeployablePercent',
+      policyValue(params, 'maxDeployablePercent') as number,
+    )
+    : profile.defaultMaxDeployableBps;
+
+  const minOperatingBalance = policyValue(params, 'minOperatingBalance') ?? 0n;
+  const knownUpcomingOutflows = resolveUpcomingOutflows(params);
+  const recentPaymentEma = policyValue(params, 'recentPaymentEma') ?? 0n;
+  assertNonNegativeAmount('minOperatingBalance', minOperatingBalance);
+  assertNonNegativeAmount('knownUpcomingOutflows', knownUpcomingOutflows);
+  assertNonNegativeAmount('recentPaymentEma', recentPaymentEma);
+
+  const reserveRatio = policyValue(params, 'reserveRatio') ?? 0.1;
+  const reserveMultiplier = policyValue(params, 'reserveMultiplier') ?? 3;
+  ratioToBps('reserveRatio', reserveRatio);
+  ratioToBps('reserveMultiplier', reserveMultiplier);
+
+  return {
+    minOperatingBalance,
+    knownUpcomingOutflows,
+    maxDeployableBps,
+    riskPreference,
+    recentPaymentEma,
+    reserveRatio,
+    reserveMultiplier,
+  };
 }
 
 function approvalAmountWithDustBuffer(amount: bigint): bigint {
@@ -374,20 +808,52 @@ function resolveChain(config: DivigentConfig): DivigentChain {
 
   const publicChainId = config.publicClient.chain?.id;
   const walletChainId = config.walletClient?.chain?.id;
+  const executorChainId = config.executor?.chainId;
   const publicChain = publicChainId === undefined ? undefined : chainFromId(publicChainId);
   const walletChain = walletChainId === undefined ? undefined : chainFromId(walletChainId);
+  const executorChain = executorChainId === undefined ? undefined : chainFromId(executorChainId);
 
   if (publicChain !== undefined && walletChain !== undefined && publicChain !== walletChain) {
     throw new ChainMismatchError(CHAINS[publicChain].id, CHAINS[walletChain].id, 'walletClient');
   }
+  if (publicChain !== undefined && executorChain !== undefined && publicChain !== executorChain) {
+    throw new ChainMismatchError(CHAINS[publicChain].id, CHAINS[executorChain].id, 'executor');
+  }
+  if (walletChain !== undefined && executorChain !== undefined && walletChain !== executorChain) {
+    throw new ChainMismatchError(CHAINS[walletChain].id, CHAINS[executorChain].id, 'executor');
+  }
 
-  return publicChain ?? walletChain ?? 'base-sepolia';
+  return publicChain ?? walletChain ?? executorChain ?? 'base-sepolia';
+}
+
+function validateExecutor(executor: DivigentCallExecutor | undefined): DivigentCallExecutor | undefined {
+  if (executor === undefined) return undefined;
+  if (!isAddress(executor.account)) {
+    throw new DivigentError(
+      `[@divigent/sdk] DivigentConfig.executor.account is not a valid EVM address: ${JSON.stringify(executor.account)}`,
+      {
+        code: 'DIVIGENT_INVALID_ADDRESS',
+        category: 'validation',
+        context: { field: 'DivigentConfig.executor.account', value: executor.account },
+      },
+    );
+  }
+  if (isZeroAddress(executor.account)) {
+    throw new ZeroAddressError({
+      context: { field: 'DivigentConfig.executor.account' },
+    });
+  }
+  return {
+    ...executor,
+    account: getAddress(executor.account) as EvmAddress,
+  };
 }
 
 /** @notice Main viem-native facade for Divigent reads, writes, signing, and x402 hooks. */
 export class Divigent {
   readonly publicClient: PublicClient;
   readonly walletClient: WalletClient | undefined;
+  readonly executor: DivigentCallExecutor | undefined;
   readonly chain: DivigentChain;
   readonly addresses: ContractAddresses;
 
@@ -398,11 +864,13 @@ export class Divigent {
   private constructor(cfg: {
     publicClient: PublicClient;
     walletClient: WalletClient | undefined;
+    executor: DivigentCallExecutor | undefined;
     chain: DivigentChain;
     addresses: ContractAddresses;
   }) {
     this.publicClient = cfg.publicClient;
     this.walletClient = cfg.walletClient;
+    this.executor     = cfg.executor;
     this.chain       = cfg.chain;
     this.addresses   = cfg.addresses;
   }
@@ -424,6 +892,9 @@ export class Divigent {
     if (config.publicClient.chain && config.publicClient.chain.id !== expectedChainId) {
       throw new ChainMismatchError(expectedChainId, config.publicClient.chain.id, 'publicClient');
     }
+    if (config.executor?.chainId !== undefined && config.executor.chainId !== expectedChainId) {
+      throw new ChainMismatchError(expectedChainId, config.executor.chainId, 'executor');
+    }
 
     let addresses: ContractAddresses;
     if (config.addresses) {
@@ -436,6 +907,7 @@ export class Divigent {
     return new Divigent({
       publicClient: config.publicClient,
       walletClient: config.walletClient,
+      executor: validateExecutor(config.executor),
       chain,
       addresses,
     });
@@ -548,7 +1020,36 @@ export class Divigent {
     return { walletClient, account: walletClient.account, chain: walletClient.chain };
   }
 
+  private requireExecutionSigner(): {
+    account: NonNullable<WalletClient['account']> | EvmAddress;
+    owner: EvmAddress;
+    chain: NonNullable<WalletClient['chain'] | PublicClient['chain']>;
+  } {
+    if (this.executor) {
+      const chain = this.walletClient?.chain ?? this.publicClient.chain;
+      if (!chain) {
+        throw new DivigentError('[@divigent/sdk] executor operation requires a bound chain', {
+          code: 'DIVIGENT_WALLET_CHAIN_REQUIRED',
+          category: 'wallet',
+        });
+      }
+      return {
+        account: this.executor.account,
+        owner: this.executor.account,
+        chain,
+      };
+    }
+
+    const { account, chain } = this.requireSigner();
+    return {
+      account,
+      owner: account.address as EvmAddress,
+      chain,
+    };
+  }
+
   private defaultWallet(): EvmAddress {
+    if (this.executor) return this.executor.account;
     const wc = this.requireWallet();
     if (!wc.account) {
       throw new DivigentError('[@divigent/sdk] walletClient has no account', {
@@ -846,13 +1347,304 @@ export class Divigent {
     return readUsdcAllowance(this.publicClient, this.addresses.usdc, owner, this.addresses.router);
   }
 
+  // Liquidity intelligence
+
+  private async readLiquidityVenueHealth(): Promise<LiquidityVenueHealth> {
+    const [oracle, withdrawCapacity, allocation, rates] = await Promise.all([
+      this.oracleStatus(),
+      this.withdrawCapacity(),
+      this.getCurrentAllocation(),
+      this.getAllRates(),
+    ]);
+    const status = oracle.fresh &&
+      venueSetReachable(withdrawCapacity, rates) &&
+      rates.every((rate) => rate.isSafe)
+      ? 'healthy'
+      : 'degraded';
+
+    return {
+      status,
+      oracleFresh: oracle.fresh,
+      lastObservationTime: oracle.lastObservationTime,
+      withdrawCapacity,
+      allocation,
+      rates,
+    };
+  }
+
+  /**
+   * @notice Assess wallet liquidity without moving funds.
+   *
+   * @remarks Risk preference only changes reserve posture. Execution still goes
+   * through Divigent Protocol and its approved venues.
+   * @param params Wallet, pending payment, and optional policy context.
+   * @returns Reserve, recall, deployment, and optional venue-health decisions.
+   */
+  async assessLiquidity(params: AssessLiquidityParams = {}): Promise<LiquidityAssessment> {
+    const wallet = params.wallet ?? this.defaultWallet();
+    const pendingAmount = pendingPaymentAmount(params);
+    assertNonNegativeAmount('pendingPaymentAmount', pendingAmount);
+    const recallSlippageBps = params.recallSlippageBps ?? PAYMENT_PATH_SLIPPAGE_BPS;
+    // Validate bps early; recall projections apply the slippage haircut below.
+    applySlippageDown(1n, recallSlippageBps);
+
+    const policy = resolveLiquidityPolicy(params);
+    const profile = RISK_PROFILES[policy.riskPreference];
+    const minDepositPromise = params.minDeposit !== undefined
+      ? Promise.resolve(params.minDeposit)
+      : this.minDeposit();
+    const venueHealthPromise = params.includeVenueHealth
+      ? this.readLiquidityVenueHealth()
+      : Promise.resolve(undefined);
+
+    const [minDeposit, walletBalance, position, venueHealth] = await Promise.all([
+      minDepositPromise,
+      this.usdcBalance(wallet),
+      this.getPosition(wallet),
+      venueHealthPromise,
+    ]);
+    assertNonNegativeAmount('minDeposit', minDeposit);
+
+    const reserveRatioBps = ratioToBps('reserveRatio', policy.reserveRatio);
+    const reserveMultiplierBps = ratioToBps('reserveMultiplier', policy.reserveMultiplier);
+    const adaptiveBps = (reserveRatioBps * reserveMultiplierBps) / BPS;
+    const adaptiveReserve = applyBpsCeil(policy.recentPaymentEma, adaptiveBps);
+    const hardReserve = policy.minOperatingBalance + policy.knownUpcomingOutflows;
+    const baseReserve = bigintMax(hardReserve, adaptiveReserve);
+    // Conservative profiles may pad hard business floors. Lighter profiles can
+    // reduce adaptive reserve posture, but never below hard obligations.
+    const riskAdjustedReserve = profile.reserveBps >= BPS
+      ? applyBpsCeil(baseReserve, profile.reserveBps)
+      : applyBps(baseReserve, profile.reserveBps);
+    const requiredReserve = profile.reserveBps >= BPS
+      ? riskAdjustedReserve
+      : bigintMax(hardReserve, riskAdjustedReserve);
+    const targetLiquidBalance = pendingAmount + requiredReserve;
+    const recommendedRecallAmount = walletBalance >= targetLiquidBalance
+      ? 0n
+      : targetLiquidBalance - walletBalance;
+
+    const paymentDeficit = pendingAmount > walletBalance ? pendingAmount - walletBalance : 0n;
+
+    let executableRecallAmount = 0n;
+    let executableRecallNetAmount = 0n;
+    let recallCoversTarget = false;
+    let recommendedRecallShares: bigint | undefined;
+    let recallUnavailableCode: LiquidityRecallUnavailableCode | undefined;
+    let recallUnavailableReason: string | undefined;
+    if (recommendedRecallAmount > 0n && position.currentValue <= 0n) {
+      recallUnavailableCode = 'no_position';
+      recallUnavailableReason = 'wallet has no deployed Divigent position to recall from';
+    } else if (recommendedRecallAmount > 0n && position.currentValue < recommendedRecallAmount) {
+      recallUnavailableCode = 'position_insufficient';
+      recallUnavailableReason = 'deployed Divigent position cannot fully satisfy the target reserve';
+      const paymentRecallAmount = grossUpForSlippage(paymentDeficit, recallSlippageBps);
+      if (paymentDeficit > 0n && position.currentValue >= paymentRecallAmount) {
+        try {
+          const shares = await this.previewWithdrawNet(paymentRecallAmount, wallet);
+          if (shares > 0n) {
+            recommendedRecallShares = shares;
+            executableRecallAmount = paymentRecallAmount;
+            executableRecallNetAmount = applySlippageDown(paymentRecallAmount, recallSlippageBps);
+          }
+        } catch (err) {
+          recallUnavailableCode = 'preview_failed';
+          recallUnavailableReason = unknownMessage(err);
+        }
+      }
+    } else if (recommendedRecallAmount > 0n) {
+      try {
+        const shares = await this.previewWithdrawNet(recommendedRecallAmount, wallet);
+        if (shares > 0n) {
+          recommendedRecallShares = shares;
+          executableRecallAmount = recommendedRecallAmount;
+          executableRecallNetAmount = applySlippageDown(recommendedRecallAmount, recallSlippageBps);
+          recallCoversTarget = true;
+        }
+      } catch (err) {
+        recallUnavailableCode = 'preview_failed';
+        recallUnavailableReason = unknownMessage(err);
+      }
+    }
+
+    const maxDeployableAmount = applyBps(walletBalance, policy.maxDeployableBps);
+    const rawDeployable = walletBalance > targetLiquidBalance
+      ? walletBalance - targetLiquidBalance
+      : 0n;
+    const deployableExcess = bigintMin(rawDeployable, maxDeployableAmount);
+    let recommendedDeploymentAmount = deployableExcess >= minDeposit
+      ? deployableExcess
+      : 0n;
+
+    let preferredVenue: VaultType | undefined;
+    let venueUnavailableReason: string | undefined;
+    if (recommendedDeploymentAmount > 0n) {
+      try {
+        preferredVenue = await this.getRecommendedRoute(recommendedDeploymentAmount);
+      } catch (err) {
+        venueUnavailableReason = unknownMessage(err);
+        recommendedDeploymentAmount = 0n;
+      }
+    }
+
+    const paymentReady = pendingAmount === 0n || walletBalance >= pendingAmount;
+    const reserveHealthy = recommendedRecallAmount === 0n;
+    const canBecomePaymentReady = paymentReady ||
+      (recommendedRecallShares !== undefined &&
+        recommendedRecallShares > 0n &&
+        walletBalance + executableRecallNetAmount >= pendingAmount);
+    const liquidityStatus: LiquidityStatus = reserveHealthy
+      ? 'healthy'
+      : paymentReady
+        ? 'reserve_low'
+        : canBecomePaymentReady && !recallCoversTarget
+          ? 'partial_recall_only'
+          : canBecomePaymentReady
+            ? 'needs_recall'
+            : 'insufficient_liquidity';
+    const recommendedActions: LiquidityAction[] = [];
+    if (recommendedRecallShares !== undefined && recommendedRecallShares > 0n) {
+      recommendedActions.push('recall');
+    }
+    if (recommendedDeploymentAmount > 0n) {
+      recommendedActions.push('deploy');
+    }
+    const recommendedAction: LiquidityRecommendedAction = liquidityStatus === 'insufficient_liquidity'
+      ? 'insufficient_liquidity'
+      : recommendedActions.includes('recall')
+        ? 'recall'
+        : recommendedActions.includes('deploy')
+          ? 'deploy'
+          : 'none';
+
+    return {
+      wallet,
+      riskPreference: policy.riskPreference,
+      paymentReady,
+      canBecomePaymentReady,
+      reserveHealthy,
+      liquidityStatus,
+      pendingPaymentAmount: pendingAmount,
+      walletBalance,
+      positionCurrentValue: position.currentValue,
+      requiredReserve,
+      targetLiquidBalance,
+      minOperatingBalance: policy.minOperatingBalance,
+      knownUpcomingOutflows: policy.knownUpcomingOutflows,
+      upcomingKnownPayouts: policy.knownUpcomingOutflows,
+      adaptiveReserve,
+      maxDeployableAmount,
+      deployableExcess,
+      recommendedDeploymentAmount,
+      recommendedActions,
+      recommendedAction,
+      recallRequired: recommendedRecallAmount > 0n,
+      recommendedRecallAmount,
+      executableRecallAmount,
+      executableRecallNetAmount,
+      recallCoversTarget,
+      ...(recommendedRecallShares !== undefined && { recommendedRecallShares }),
+      ...(recallUnavailableCode !== undefined && { recallUnavailableCode }),
+      ...(preferredVenue !== undefined && { preferredVenue }),
+      ...(venueHealth !== undefined && { venueHealth }),
+      ...(recallUnavailableReason !== undefined && { recallUnavailableReason }),
+      ...(venueUnavailableReason !== undefined && { venueUnavailableReason }),
+    };
+  }
+
+  /**
+   * @notice Recall USDC when needed to satisfy `assessLiquidity`.
+   * @param params Liquidity policy plus withdrawal slippage/wait options.
+   * @returns The initial assessment and optional recall transaction result.
+   */
+  async ensurePaymentReady(
+    params: EnsurePaymentReadyParams = {},
+  ): Promise<EnsurePaymentReadyResult> {
+    const wallet = params.wallet ?? this.defaultWallet();
+    return withOwnerLock(wallet, async () => this.ensurePaymentReadyLocked({
+      ...params,
+      wallet,
+    }));
+  }
+
+  private async ensurePaymentReadyLocked(
+    params: EnsurePaymentReadyParams & { wallet: EvmAddress },
+  ): Promise<EnsurePaymentReadyResult> {
+    const assessmentParams: AssessLiquidityParams = { ...params };
+    if (assessmentParams.recallSlippageBps === undefined && params.slippageBps !== undefined) {
+      assessmentParams.recallSlippageBps = params.slippageBps;
+    }
+    const assessment = await this.assessLiquidity(assessmentParams);
+    if (!assessment.recallRequired) return { assessment };
+    if (assessment.paymentReady && (params.reserveTopUp ?? 'skip') === 'skip') {
+      return { assessment };
+    }
+
+    if (
+      assessment.recommendedRecallShares === undefined ||
+      assessment.recommendedRecallShares <= 0n
+    ) {
+      if (assessment.paymentReady) return { assessment };
+      throw new DivigentError(
+        '[@divigent/sdk] wallet is not payment-ready and no Divigent recall is available',
+        {
+          code: 'DIVIGENT_LIQUIDITY_RECALL_UNAVAILABLE',
+          category: 'wallet',
+          retryable: true,
+          context: {
+            wallet: assessment.wallet,
+            pendingPaymentAmount: assessment.pendingPaymentAmount,
+            walletBalance: assessment.walletBalance,
+            recommendedRecallAmount: assessment.recommendedRecallAmount,
+            recallUnavailableCode: assessment.recallUnavailableCode,
+            recallUnavailableReason: assessment.recallUnavailableReason,
+          },
+        },
+      );
+    }
+
+    const waitOptions: WaitOptions = {};
+    if (params.confirmations !== undefined) waitOptions.confirmations = params.confirmations;
+    if (params.pollingInterval !== undefined) waitOptions.pollingInterval = params.pollingInterval;
+    if (params.timeout !== undefined) waitOptions.timeout = params.timeout;
+
+    const withdrawal = await this.withdrawAndWait({
+      ...waitOptions,
+      shares: assessment.recommendedRecallShares,
+      wallet: assessment.wallet,
+      slippageBps: params.slippageBps ?? PAYMENT_PATH_SLIPPAGE_BPS,
+      ...(params.fees && { fees: params.fees }),
+    });
+
+    return {
+      assessment,
+      recallTxHash: withdrawal.txHash,
+      usdcReturned: withdrawal.usdcReturned,
+    };
+  }
+
   // Wallet registration writes
 
   /**
    * @notice Initialize the connected wallet with the router.
    * @returns Transaction hash.
    */
-  initialize(): Promise<TxHash> {
+  async initialize(): Promise<TxHash> {
+    if (this.executor) {
+      const { account, chain } = this.requireExecutionSigner();
+      const { request } = await runWrite(() => this.publicClient.simulateContract({
+        address: this.addresses.router,
+        abi: routerAbi,
+        functionName: 'initialize',
+        account,
+        chain,
+      }), routerAbi);
+      return this.sendPlan({
+        kind: 'initialize',
+        request,
+      });
+    }
+
     return initializeWrite({
       walletClient: this.requireWallet(),
       publicClient: this.publicClient,
@@ -944,6 +1736,10 @@ export class Divigent {
     wallet: EvmAddress,
     minSharesOut: bigint,
   ): Promise<TxHash> {
+    if (this.executor) {
+      return this.planDeposit({ ...params, wallet, minSharesOut }).then((plan) => this.sendPlan(plan));
+    }
+
     return depositWrite({
       walletClient: this.requireWallet(),
       publicClient: this.publicClient,
@@ -1033,9 +1829,9 @@ export class Divigent {
    * @param fees Optional EIP-1559 fee overrides.
    * @returns Transaction hash.
    */
-  approveUsdc(amount: bigint, fees?: FeeOverrides): Promise<TxHash> {
-    const approvalAmount = approvalAmountWithDustBuffer(amount);
-    return this.approveUsdcAmount(approvalAmount, fees);
+  async approveUsdc(amount: bigint, fees?: FeeOverrides): Promise<TxHash> {
+    const plan = await this.planApproveUsdc(amount, fees);
+    return this.sendPlan(plan);
   }
 
   /**
@@ -1047,7 +1843,7 @@ export class Divigent {
    * @returns A viem-ready write request and approval metadata.
    */
   async planApproveUsdc(amount: bigint, fees?: FeeOverrides): Promise<ApproveUsdcPlan> {
-    const { account, chain } = this.requireSigner();
+    const { account, owner, chain } = this.requireExecutionSigner();
     const approvalAmount = approvalAmountWithDustBuffer(amount);
     const { request, result } = await runWrite(() => this.publicClient.simulateContract({
       address: this.addresses.usdc,
@@ -1060,7 +1856,7 @@ export class Divigent {
 
     return {
       kind: 'approveUsdc',
-      owner: account.address as EvmAddress,
+      owner,
       token: this.addresses.usdc,
       spender: this.addresses.router,
       amount,
@@ -1080,8 +1876,7 @@ export class Divigent {
    * @returns Deposit request, preview values, and approval requirement.
    */
   async planDeposit(params: DepositParams): Promise<DepositPlan> {
-    const { account, chain } = this.requireSigner();
-    const owner = account.address as EvmAddress;
+    const { account, owner, chain } = this.requireExecutionSigner();
     const wallet = params.wallet ?? owner;
     const previewShares = await this.previewDeposit(params.amount);
     const slippageBps = params.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
@@ -1157,6 +1952,67 @@ export class Divigent {
    */
   async depositAndWait(params: DepositParams & WaitOptions): Promise<DepositResult> {
     const hash = await this.deposit(params);
+    const receipt = await this.waitForReceipt(hash, params);
+    return parseDepositReceipt(receipt);
+  }
+
+  /**
+   * @notice Deposit using an allowance-backed flow.
+   * @remarks EOAs execute approval and deposit sequentially when needed.
+   * Smart-account executors can batch approval + deposit in one operation.
+   * Prefer this path for smart accounts because USDC permit signatures are
+   * generally EOA-oriented.
+   * @param params Deposit amount, optional credited wallet, slippage, and fees.
+   * @returns Deposit transaction hash, or the batch transaction hash for executor-backed deposits.
+   */
+  async depositWithApproval(params: DepositWithApprovalParams): Promise<TxHash> {
+    const wallet = params.wallet ?? this.defaultWallet();
+    await this.assertMinDepositAmount(params.amount);
+    const minSharesOut = await this.resolveMinSharesOut(params);
+
+    if (!this.executor) {
+      return this.depositViaApproval(params, wallet, minSharesOut);
+    }
+
+    if (!sameAddress(wallet, this.executor.account)) {
+      throw new DivigentError(
+        '[@divigent/sdk] executor-backed deposits require wallet to match executor.account',
+        {
+          code: 'DIVIGENT_EXECUTOR_WALLET_MISMATCH',
+          category: 'validation',
+          context: { wallet, executor: this.executor.account },
+        },
+      );
+    }
+
+    const depositPlan = await this.planDeposit({ ...params, wallet, minSharesOut });
+    const plans: DivigentTransactionPlan[] = [];
+    const targetAllowance = approvalAmountWithDustBuffer(params.amount);
+    if (depositPlan.allowance < targetAllowance) {
+      plans.push(await this.planApproveUsdc(params.amount, params.fees));
+    }
+    plans.push(depositPlan);
+
+    const result = await this.sendPlans(plans);
+    const hash = result.txHashes.at(-1);
+    if (!hash) {
+      throw new DivigentError('[@divigent/sdk] depositWithApproval produced no transaction hash', {
+        code: 'DIVIGENT_EXECUTOR_RESULT_UNRESOLVED',
+        category: 'wallet',
+      });
+    }
+    return hash;
+  }
+
+  /**
+   * @notice Approval-backed deposit, wait for mining, and parse minted shares.
+   * @param params Deposit amount, optional wallet override, wait options, and optional fees.
+   * @returns Parsed deposit result.
+   */
+  async depositWithApprovalAndWait(
+    params: DepositWithApprovalParams & WaitOptions,
+  ): Promise<DepositResult> {
+    const hash = await this.depositWithApproval(params);
     const receipt = await this.waitForReceipt(hash, params);
     return parseDepositReceipt(receipt);
   }
@@ -1248,6 +2104,11 @@ export class Divigent {
    * @returns Transaction hash.
    */
   async withdraw(params: WithdrawParams): Promise<TxHash> {
+    if (this.executor) {
+      const plan = await this.planWithdraw(params);
+      return this.sendPlan(plan);
+    }
+
     const wallet = params.wallet ?? this.defaultWallet();
     let minUsdcOut = params.minUsdcOut;
 
@@ -1274,8 +2135,7 @@ export class Divigent {
    * @returns A viem-ready withdraw request and preview/simulation metadata.
    */
   async planWithdraw(params: WithdrawParams): Promise<WithdrawPlan> {
-    const { account, chain } = this.requireSigner();
-    const owner = account.address as EvmAddress;
+    const { account, owner, chain } = this.requireExecutionSigner();
     const wallet = params.wallet ?? owner;
     const previewUsdcOut = await this.previewRedeem(params.shares, wallet);
     const slippageBps = params.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
@@ -1303,15 +2163,178 @@ export class Divigent {
     };
   }
 
+  private executionContext(
+    plans: readonly DivigentTransactionPlan[],
+    options: WaitOptions,
+  ): DivigentExecutionContext {
+    return {
+      publicClient: this.publicClient,
+      chain: this.chain,
+      chainId: CHAINS[this.chain].id,
+      addresses: this.addresses,
+      plans,
+      waitOptions: options,
+    };
+  }
+
+  private planToCall(plan: DivigentTransactionPlan): DivigentCall {
+    const request = plan.request as unknown as {
+      address?: EvmAddress;
+      to?: EvmAddress;
+      data?: `0x${string}`;
+      abi?: unknown;
+      functionName?: string;
+      args?: readonly unknown[];
+      value?: bigint;
+    };
+    if (request.to !== undefined) {
+      throw new DivigentError('[@divigent/sdk] planned contract write must use request.address, not request.to', {
+        code: 'DIVIGENT_PLAN_TARGET_UNSUPPORTED',
+        category: 'validation',
+        context: { kind: plan.kind },
+      });
+    }
+
+    const to = request.address;
+    if (!to || !isAddress(to)) {
+      throw new DivigentError('[@divigent/sdk] planned transaction is missing a target address', {
+        code: 'DIVIGENT_PLAN_TARGET_MISSING',
+        category: 'validation',
+        context: { kind: plan.kind },
+      });
+    }
+
+    let data = request.data;
+    if (!data) {
+      if (!request.abi || !request.functionName) {
+        throw new DivigentError('[@divigent/sdk] planned transaction is missing calldata', {
+          code: 'DIVIGENT_PLAN_CALLDATA_MISSING',
+          category: 'validation',
+          context: { kind: plan.kind },
+        });
+      }
+      const inputCount = abiFunctionInputCount(request.abi, request.functionName);
+      const args = request.args;
+      if (args === undefined && inputCount !== 0) {
+        throw new DivigentError('[@divigent/sdk] planned transaction is missing function arguments', {
+          code: 'DIVIGENT_PLAN_ARGS_MISSING',
+          category: 'validation',
+          context: { kind: plan.kind, functionName: request.functionName },
+        });
+      }
+      if (args !== undefined && inputCount !== undefined && args.length !== inputCount) {
+        throw new DivigentError('[@divigent/sdk] planned transaction argument count does not match ABI', {
+          code: 'DIVIGENT_PLAN_ARGS_MISMATCH',
+          category: 'validation',
+          context: {
+            kind: plan.kind,
+            functionName: request.functionName,
+            expected: inputCount,
+            received: args.length,
+          },
+        });
+      }
+      data = encodeFunctionData({
+        abi: request.abi,
+        functionName: request.functionName,
+        args: args ?? [],
+      } as never);
+    }
+
+    return {
+      to: getAddress(to) as EvmAddress,
+      data,
+      ...(request.value !== undefined && { value: request.value }),
+    };
+  }
+
   /**
    * @notice Broadcast a previously planned Divigent transaction.
    * @param plan Plan returned by `planApproveUsdc`, `planDeposit`, or `planWithdraw`.
    * @returns Transaction hash.
    */
   async sendPlan(plan: DivigentTransactionPlan): Promise<TxHash> {
+    if (this.executor) {
+      const result = await this.sendPlans([plan]);
+      const hash = result.txHashes.at(-1);
+      if (!hash) {
+        throw new DivigentError('[@divigent/sdk] executor produced no transaction hash', {
+          code: 'DIVIGENT_EXECUTOR_RESULT_UNRESOLVED',
+          category: 'wallet',
+        });
+      }
+      return hash;
+    }
+
     const walletClient = this.requireWallet();
     const hash = await runWrite(() => walletClient.writeContract(plan.request as never));
     return txHash(hash);
+  }
+
+  /**
+   * @notice Broadcast multiple planned transactions.
+   * @remarks Without an executor, plans are sent sequentially and intermediate
+   * transactions are waited on before the next plan is broadcast. With an
+   * executor, all plans are converted to raw calls and submitted as one batch.
+   * @param plans Plans returned by Divigent planning helpers.
+   * @param options Optional wait settings for intermediate or executor waits.
+   * @returns Execution mode and transaction hashes.
+   */
+  async sendPlans(
+    plans: readonly DivigentTransactionPlan[],
+    options: WaitOptions = {},
+  ): Promise<DivigentSendPlansResult> {
+    if (plans.length === 0) {
+      throw new DivigentError('[@divigent/sdk] sendPlans requires at least one plan', {
+        code: 'DIVIGENT_EMPTY_PLAN_BATCH',
+        category: 'validation',
+      });
+    }
+
+    if (!this.executor) {
+      const walletClient = this.requireWallet();
+      const txHashes: TxHash[] = [];
+      for (let i = 0; i < plans.length; i++) {
+        const plan = plans[i];
+        if (!plan) continue;
+        const hash = txHash(await runWrite(() => walletClient.writeContract(plan.request as never)));
+        txHashes.push(hash);
+        if (i < plans.length - 1) {
+          await this.waitForReceipt(hash, options);
+          if (plan.kind === 'approveUsdc') {
+            const approval = plan as ApproveUsdcPlan;
+            await this.waitForUsdcApprovalVisible(approval.owner, approval.approvalAmount);
+          }
+        }
+      }
+      return { mode: 'sequential', txHashes };
+    }
+
+    const calls = plans.map((plan) => this.planToCall(plan));
+    const context = this.executionContext(plans, options);
+    const handle = await this.executor.executeCalls(calls, context);
+    let hash = handle.txHash;
+    if (!hash && this.executor.waitForResult) {
+      const receipt = await this.executor.waitForResult(handle, context);
+      hash = receipt.txHash;
+    }
+    if (!hash) {
+      throw new DivigentError(
+        '[@divigent/sdk] executor did not provide a transaction hash. ' +
+          'Return txHash or implement waitForResult().',
+        {
+          code: 'DIVIGENT_EXECUTOR_RESULT_UNRESOLVED',
+          category: 'wallet',
+          context: { handle },
+        },
+      );
+    }
+
+    return {
+      mode: 'batched',
+      txHashes: [txHash(hash)],
+      handle,
+    };
   }
 
   /**
