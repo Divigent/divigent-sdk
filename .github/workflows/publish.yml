@@ -1,0 +1,56 @@
+name: Publish to npm
+
+# Trusted Publishing via GitHub Actions OIDC. No NPM_TOKEN secret required —
+# the workflow's id-token is exchanged with npm for a short-lived publish
+# credential at the moment of publish.
+#
+# Prerequisite: link this workflow as a Trusted Publisher for @divigent/sdk
+# at https://www.npmjs.com/settings/divigent/packages → @divigent/sdk →
+# "Trusted Publishers" → Add (workflow: publish.yml, env: <none>).
+#
+# Trigger: push a tag matching v* (e.g. v1.0.3). The tag's version must match
+# package.json's "version" field exactly, or the workflow aborts before
+# publishing.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm (Trusted Publishing requires npm >= 11.5.1)
+        run: npm install -g npm@latest
+
+      - name: Verify tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag v$TAG does not match package.json version $PKG"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run unit tests
+        run: npm test
+
+      # npm publish runs `prepublishOnly` automatically (clean + typecheck + build).
+      # --provenance generates an attestation linking the published artifact to
+      # this workflow run.
+      - name: Publish to npm
+        run: npm publish --provenance --access public
