@@ -1,7 +1,12 @@
 # @divigent/sdk
 
-Viem-native TypeScript SDK for the Divigent yield router on Base mainnet and
-Base Sepolia.
+> **Payment-ready treasury for agent wallets.** Viem-native TypeScript SDK that keeps funded wallets liquid for spend while deploying excess USDC into monitored venues (Aave V3, Steakhouse USDC Prime MetaMorpho V1) on Base mainnet and Base Sepolia.
+
+*Policy platforms decide whether an agent may pay. Divigent makes sure the wallet can pay.*
+
+```text
+Agent → Policy → Divigent → x402 → Venues
+```
 
 ## Mainnet Notice
 
