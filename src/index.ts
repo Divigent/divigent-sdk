@@ -42,6 +42,24 @@ export type {
   Eip5792ExecutorConfig,
 } from './execution';
 
+// Wallet analysis
+
+export {
+  analyzeMissedYield,
+  analyzeWalletBehavior,
+  getProtocolMetricsWithClient,
+} from './analysis';
+export type {
+  AnalyzeMissedYieldInput,
+  AnalyzeWalletBehaviorInput,
+  DivigentProtocolMetrics,
+  MissedYieldReport,
+  ProtocolMetricsClientInput,
+  UsdcTransferDirection,
+  UsdcTransferEvent,
+  WalletBehaviorReport,
+} from './analysis';
+
 // Chains and address registry
 
 export {

@@ -71,6 +71,9 @@ Common read methods:
 
 - `getPosition(wallet)`
 - `assessLiquidity(params)`
+- `analyzeWalletBehavior(params)`
+- `analyzeMissedYield(params)`
+- `getProtocolMetrics()`
 - `withdrawCapacity()`
 - `getCurrentAllocation()`
 - `getRecommendedRoute(amount)`
@@ -106,6 +109,62 @@ Helpers:
 - `formatUsdc(value)`
 - `evmAddress(value)`
 - `txHash(value)`
+
+## Wallet Behavior Analysis
+
+The SDK can analyze public Base USDC transfer history for a wallet without
+signing or broadcasting anything. This is useful for agent/MCP onboarding:
+first explain how the wallet behaves, then estimate how much idle USDC could
+have been kept productive.
+
+```ts
+const behavior = await divigent.analyzeWalletBehavior({
+  wallet: evmAddress('0x...'),
+  lookbackDays: 30,
+});
+
+console.log(behavior.pattern.inferredRole);
+console.log(behavior.activity.p95PaymentUsdc);
+
+const missedYield = await divigent.analyzeMissedYield({
+  wallet: evmAddress('0x...'),
+  lookbackDays: 30,
+  assumedApy: 0.045,
+  minOperatingBalance: '0.25',
+});
+
+console.log(missedYield.headline.primary);
+console.log(missedYield.headline.secondary);
+```
+
+`analyzeWalletBehavior(...)` returns current/average USDC balance, incoming and
+outgoing transfer counts, payment distribution stats, cadence, inferred role,
+and an EIP-3009/x402 signal when USDC moves out while the wallet nonce remains
+zero.
+
+`analyzeMissedYield(...)` replays a deterministic reserve over the same
+historical window and reports deployable USDC-days, estimated missed yield,
+capital efficiency, and short headline strings an agent can quote directly.
+
+These analysis helpers scan ERC-20 logs through the configured RPC. For longer
+windows, use a reliable Base RPC provider.
+
+`getProtocolMetrics()` returns protocol-level traction metrics from on-chain
+router events and live accounting:
+
+```ts
+const metrics = await divigent.getProtocolMetrics();
+
+console.log(metrics.wallets.uniqueWalletsUsingDivigent);
+console.log(metrics.volume.cumulativeDepositedUsdc);
+console.log(metrics.tvl.currentTvlUsdc);
+console.log(metrics.transactions.recallProxyTransactions);
+```
+
+The x402-specific transaction count is reported as a recall proxy. Router
+events can prove Divigent withdrawals/recalls on-chain, but cannot prove that
+the recalled USDC was later settled through x402 unless an SDK/backend telemetry
+layer correlates those flows.
 
 ## Liquidity Intelligence
 

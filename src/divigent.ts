@@ -1,5 +1,5 @@
 import type { PublicClient, WalletClient, WriteContractParameters } from 'viem';
-import { encodeFunctionData, getAddress, isAddress } from 'viem';
+import { createPublicClient, encodeFunctionData, getAddress, http, isAddress } from 'viem';
 import { routerAbi, usdcAbi } from './abis';
 import {
   CHAINS,
@@ -71,6 +71,18 @@ import {
   readUsdcBalance,
   signUsdcPermit,
 } from './contracts/usdc';
+import {
+  analyzeMissedYieldWithClient,
+  analyzeWalletBehaviorWithClient,
+  getProtocolMetricsWithClient,
+} from './analysis';
+import type {
+  AnalyzeMissedYieldInput,
+  AnalyzeWalletBehaviorInput,
+  DivigentProtocolMetrics,
+  MissedYieldReport,
+  WalletBehaviorReport,
+} from './analysis';
 import {
   readDvUsdcBalance,
   readDvUsdcRouter,
@@ -1370,6 +1382,77 @@ export class Divigent {
       allocation,
       rates,
     };
+  }
+
+  private analysisPublicClient(rpcUrl: string | undefined): PublicClient {
+    if (rpcUrl === undefined) return this.publicClient;
+    return createPublicClient({
+      chain: CHAINS[this.chain].viemChain,
+      transport: http(rpcUrl),
+    }) as PublicClient;
+  }
+
+  private assertAnalysisChainId(chainId: number | undefined): void {
+    if (chainId === undefined) return;
+    const expected = CHAINS[this.chain].id;
+    if (chainId !== expected) {
+      throw new ChainMismatchError(expected, chainId, 'analysis');
+    }
+  }
+
+  /**
+   * @notice Analyze a wallet's recent USDC behavior without making a liquidity recommendation.
+   * @remarks Read-only. Scans Base USDC Transfer logs for the requested window and never signs or broadcasts.
+   */
+  async analyzeWalletBehavior(
+    params: AnalyzeWalletBehaviorInput,
+  ): Promise<WalletBehaviorReport> {
+    this.assertAnalysisChainId(params.chainId);
+    return analyzeWalletBehaviorWithClient({
+      publicClient: this.analysisPublicClient(params.rpcUrl),
+      usdcAddress: this.addresses.usdc,
+      internalAddresses: [this.addresses.router],
+      wallet: params.wallet,
+      chainId: CHAINS[this.chain].id,
+      ...(params.lookbackDays !== undefined && { lookbackDays: params.lookbackDays }),
+    });
+  }
+
+  /**
+   * @notice Estimate historical missed yield from deployable idle USDC.
+   * @remarks Read-only. Replays deterministic reserve math over historical USDC transfers.
+   */
+  async analyzeMissedYield(
+    params: AnalyzeMissedYieldInput,
+  ): Promise<MissedYieldReport> {
+    this.assertAnalysisChainId(params.chainId);
+    return analyzeMissedYieldWithClient({
+      publicClient: this.analysisPublicClient(params.rpcUrl),
+      usdcAddress: this.addresses.usdc,
+      internalAddresses: [this.addresses.router],
+      wallet: params.wallet,
+      chainId: CHAINS[this.chain].id,
+      ...(params.lookbackDays !== undefined && { lookbackDays: params.lookbackDays }),
+      ...(params.assumedApy !== undefined && { assumedApy: params.assumedApy }),
+      ...(params.minOperatingBalance !== undefined && {
+        minOperatingBalance: params.minOperatingBalance,
+      }),
+      ...(params.behavior !== undefined && { behavior: params.behavior }),
+    });
+  }
+
+  /**
+   * @notice Read protocol-level traction metrics from on-chain Base events and live accounting.
+   * @remarks Read-only. Uses the SDK's configured public client, so pass a premium RPC into
+   * `Divigent.create(...)` when scanning long event history.
+   */
+  getProtocolMetrics(): Promise<DivigentProtocolMetrics> {
+    return getProtocolMetricsWithClient({
+      publicClient: this.publicClient,
+      chainId: CHAINS[this.chain].id,
+      router: this.addresses.router,
+      dvUsdc: this.addresses.dvUsdc,
+    });
   }
 
   /**
