@@ -8,7 +8,7 @@ import {
   rescaleDecimals,
 } from '../../src/core/utils';
 import { ReserveFloor } from '../../src/x402/attach';
-import { attachDivigentYield } from '../../src/x402/attach';
+import { attachDivigentYield as attachRawDivigentYield } from '../../src/x402/attach';
 import { depositIdleAboveFloor } from '../../src/x402/settlement';
 import {
   HASH_1,
@@ -18,6 +18,16 @@ import {
   usdc,
   x402PaymentContext,
 } from '../helpers';
+
+type AttachConfig = Parameters<typeof attachRawDivigentYield>[2];
+
+function attachDivigentYield(
+  client: Parameters<typeof attachRawDivigentYield>[0],
+  divigent: Parameters<typeof attachRawDivigentYield>[1],
+  config: AttachConfig = {},
+): ReturnType<typeof attachRawDivigentYield> {
+  return attachRawDivigentYield(client, divigent, { allowAllPayTo: true, ...config });
+}
 
 function pseudoRandom(seed: bigint): () => bigint {
   let state = seed;

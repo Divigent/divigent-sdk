@@ -127,6 +127,8 @@ export type X402WrapConfig = {
   maxSessionPaymentAmount?: bigint;
   /** @notice Configuration guard requiring a non-empty payee allowlist before handling payments. */
   requireAllowedPayTo?: boolean;
+  /** @notice Explicit opt-out that allows Divigent recall hooks for any x402 payTo address. */
+  allowAllPayTo?: boolean;
   /** @notice Optional payee allowlist that scopes Divigent's recall hook. */
   allowedPayTo?: readonly string[];
   /** @notice Optional URL origin allowlist that scopes Divigent's recall hook. */

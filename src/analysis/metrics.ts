@@ -145,6 +145,7 @@ export async function getProtocolMetricsWithClient(
     },
     transactions: {
       totalDivigentTransactions: uniqueTxCount([...authorizedLogs, ...depositLogs, ...withdrawLogs]),
+      totalTreasuryOperations: uniqueTxCount([...depositLogs, ...withdrawLogs]),
       authorizationTransactions: uniqueTxCount(authorizedLogs),
       depositTransactions: uniqueTxCount(depositLogs),
       withdrawTransactions: uniqueTxCount(withdrawLogs),

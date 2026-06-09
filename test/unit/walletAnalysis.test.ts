@@ -242,6 +242,7 @@ describe('wallet analysis', () => {
     expect(metrics.tvl.aaveAssetsUsdc).toBe('4');
     expect(metrics.tvl.morphoAssetsUsdc).toBe('8.5');
     expect(metrics.transactions.totalDivigentTransactions).toBe(5);
+    expect(metrics.transactions.totalTreasuryOperations).toBe(3);
     expect(metrics.transactions.recallProxyTransactions).toBe(1);
     expect(metrics.transactions.x402SettledViaDivigent).toBeNull();
   });

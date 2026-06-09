@@ -136,6 +136,27 @@ describe('Divigent config and wallet guards', () => {
 
     expect(divigent.chain).toBe('base');
   });
+  // Exercises: bare clients must not silently fall back to the testnet deployment.
+  it('requires an explicit chain when clients do not expose chain metadata', () => {
+    const { publicClient } = createMockClients();
+    const unboundPublicClient = { ...publicClient, chain: undefined };
+
+    let thrown: unknown;
+    try {
+      Divigent.create({
+        publicClient: unboundPublicClient as typeof publicClient,
+        addresses,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(DivigentError);
+    expect(thrown).toMatchObject({
+      code: 'DIVIGENT_CHAIN_REQUIRED',
+      category: 'config',
+    });
+  });
   // Exercises: validates custom address overrides before any on-chain call.
   it('validates custom address overrides before any on-chain call', () => {
     const { publicClient, walletClient } = createMockClients();
@@ -508,6 +529,82 @@ describe('transaction planning', () => {
     await expect(divigent.sendPlan(plan)).resolves.toBe(HASH_2);
     expect(writeContract).toHaveBeenCalledWith(plan.request);
   });
+  // Exercises: runtime fee objects cannot shadow simulated request identity fields.
+  it.each(Object.entries({
+    address: SECOND_OWNER,
+    functionName: 'withdraw',
+    args: [1n, SECOND_OWNER, 1n],
+    account: SECOND_OWNER,
+    chain: baseSepolia,
+    value: 1n,
+    data: '0xdeadbeef',
+  }))('rejects unknown runtime fee key %s in approval plans', async (key, value) => {
+    const { divigent } = createDivigentWithClients();
+
+    await expect(divigent.planApproveUsdc(usdc('0.001'), { [key]: value } as never))
+      .rejects.toMatchObject({
+        code: 'DIVIGENT_INVALID_FEE_OVERRIDES',
+        category: 'validation',
+      });
+  });
+  // Exercises: deposit and withdraw planners share the same fee allowlist boundary.
+  it('rejects unknown runtime fee keys in deposit and withdraw plans', async () => {
+    const deposit = createDivigentWithClients({ allowance: usdc('0.001') });
+    const withdraw = createDivigentWithClients();
+    const fees = {
+      maxFeePerGas: 10n,
+      args: [1n, SECOND_OWNER, 1n],
+    } as never;
+
+    await expect(deposit.divigent.planDeposit({ amount: usdc('0.001'), fees }))
+      .rejects.toMatchObject({
+        code: 'DIVIGENT_INVALID_FEE_OVERRIDES',
+        category: 'validation',
+      });
+    await expect(withdraw.divigent.planWithdraw({ shares: 1_000n, fees }))
+      .rejects.toMatchObject({
+        code: 'DIVIGENT_INVALID_FEE_OVERRIDES',
+        category: 'validation',
+      });
+  });
+  // Exercises: fee values are validated before they reach viem's write path.
+  it.each([
+    ['wrong type', { maxFeePerGas: '100' }],
+    ['negative bigint', { maxPriorityFeePerGas: -1n }],
+  ])('rejects %s fee override values', async (_label, fees) => {
+    const { divigent } = createDivigentWithClients();
+
+    await expect(divigent.planApproveUsdc(usdc('0.001'), fees as never))
+      .rejects.toMatchObject({
+        code: 'DIVIGENT_INVALID_FEE_OVERRIDES',
+        category: 'validation',
+      });
+  });
+  // Exercises: direct write helpers sanitize fee overrides before broadcasting.
+  it('rejects malicious fee keys in direct approval and router write paths', async () => {
+    const approval = createDivigentWithClients({ allowance: 0n });
+    const router = createDivigentWithClients();
+
+    await expect(approval.divigent.depositWithApproval({
+      amount: usdc('0.001'),
+      minSharesOut: 1n,
+      fees: { address: SECOND_OWNER } as never,
+    })).rejects.toMatchObject({
+      code: 'DIVIGENT_INVALID_FEE_OVERRIDES',
+      category: 'validation',
+    });
+    expect(approval.writeContract).not.toHaveBeenCalled();
+
+    await expect(router.divigent.deposit({
+      amount: usdc('0.001'),
+      minSharesOut: 1n,
+      fees: { functionName: 'withdraw' } as never,
+    })).rejects.toMatchObject({
+      code: 'DIVIGENT_INVALID_FEE_OVERRIDES',
+      category: 'validation',
+    });
+    expect(router.writeContract).not.toHaveBeenCalled();
+  });
   // Exercises: executor-backed planning uses the executor account and routes calls through executeCalls.
   it('routes planned writes through a configured executor', async () => {
     const { publicClient, simulateContract, writeContract } = createMockClients();
@@ -741,6 +838,28 @@ describe('transaction planning', () => {
     });
     expect(simulateContract).not.toHaveBeenCalled();
   });
+  // Exercises: below-minimum deposits cannot hide behind a short allowance plan.
+  it('rejects planDeposit below MIN_DEPOSIT before allowance handling', async () => {
+    const { divigent, readContract, simulateContract } = createDivigentWithClients({
+      allowance: 0n,
+      minDeposit: usdc('10'),
+      previewDeposit: 1_000_000n,
+    });
+
+    await expect(divigent.planDeposit({ amount: usdc('9.999999') }))
+      .rejects.toBeInstanceOf(MinDepositNotMetError);
+
+    expect(readContract).toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'MIN_DEPOSIT',
+    }));
+    expect(readContract).not.toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'previewDeposit',
+    }));
+    expect(readContract).not.toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'allowance',
+    }));
+    expect(simulateContract).not.toHaveBeenCalled();
+  });
   // Exercises: deposit plans check allowance from the wallet that funds the deposit,
   // not from an operator or relayer submitting the transaction.
   it('plans deposit approval requirement from the funding wallet override', async () => {
@@ -748,6 +867,7 @@ describe('transaction planning', () => {
     const { divigent, readContract } = createDivigentWithClients({
       previewDeposit: 1_000_000n,
       readContract: (request) => {
+        if (request.functionName === 'MIN_DEPOSIT') return 0n;
         if (request.functionName === 'previewDeposit') return 1_000_000n;
         if (request.functionName === 'allowance') {
           expect(request.args).toEqual([SECOND_OWNER, addresses.router]);

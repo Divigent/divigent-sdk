@@ -158,6 +158,7 @@ const metrics = await divigent.getProtocolMetrics();
 console.log(metrics.wallets.uniqueWalletsUsingDivigent);
 console.log(metrics.volume.cumulativeDepositedUsdc);
 console.log(metrics.tvl.currentTvlUsdc);
+console.log(metrics.transactions.totalTreasuryOperations);
 console.log(metrics.transactions.recallProxyTransactions);
 ```
 

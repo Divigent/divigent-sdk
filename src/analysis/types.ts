@@ -144,6 +144,7 @@ export type DivigentProtocolMetrics = {
   };
   transactions: {
     totalDivigentTransactions: number;
+    totalTreasuryOperations: number;
     authorizationTransactions: number;
     depositTransactions: number;
     withdrawTransactions: number;

@@ -13,5 +13,11 @@ export function vaultTypeFromId(id: number | bigint): VaultType {
 }
 
 export function vaultTypeToId(vaultType: VaultType): 0 | 1 {
-  return vaultType === 'AAVE' ? 0 : 1;
+  if (vaultType === 'AAVE') return 0;
+  if (vaultType === 'MORPHO') return 1;
+  throw new DivigentError(`[@divigent/sdk] unknown VaultType: ${String(vaultType)}`, {
+    code: 'DIVIGENT_UNKNOWN_VAULT_TYPE',
+    category: 'validation',
+    context: { vaultType },
+  });
 }

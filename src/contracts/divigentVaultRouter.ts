@@ -2,6 +2,7 @@ import type { Hex, PublicClient, WalletClient } from 'viem';
 import { routerAbi } from '../abis';
 import { vaultTypeFromId } from '../core/vaultTypes';
 import { DivigentError, runRead, runSign, runWrite } from '../errors';
+import { sanitizeFeeOverrides } from '../fees';
 import {
   type EvmAddress,
   type FeeOverrides,
@@ -342,7 +343,8 @@ async function simulateAndWrite(
 ): Promise<`0x${string}`> {
   return runWrite(async () => {
     const { request: simulated } = await publicClient.simulateContract(request as never);
-    const final = fees ? { ...simulated, ...fees } : simulated;
+    const sanitized = sanitizeFeeOverrides(fees);
+    const final = sanitized ? { ...simulated, ...sanitized } : simulated;
     return walletClient.writeContract(final as never);
   }, routerAbi);
 }

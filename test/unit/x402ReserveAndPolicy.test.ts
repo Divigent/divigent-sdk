@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { baseSepolia } from 'viem/chains';
 import { AlreadyAttachedError, DivigentError, PaymentCapExceededError } from '../../src/errors';
-import { attachDivigentYield } from '../../src/x402/attach';
+import { attachDivigentYield as attachRawDivigentYield } from '../../src/x402/attach';
 import { ReserveFloor } from '../../src/x402/attach';
 import {
   HASH_1,
@@ -14,6 +14,16 @@ import {
   usdc,
   x402PaymentContext,
 } from './helpers';
+
+type AttachConfig = Parameters<typeof attachRawDivigentYield>[2];
+
+function attachDivigentYield(
+  client: Parameters<typeof attachRawDivigentYield>[0],
+  divigent: Parameters<typeof attachRawDivigentYield>[1],
+  config: AttachConfig = {},
+): ReturnType<typeof attachRawDivigentYield> {
+  return attachRawDivigentYield(client, divigent, { allowAllPayTo: true, ...config });
+}
 
 afterEach(() => {
   vi.useRealTimers();
@@ -133,6 +143,7 @@ describe('x402 recall hook policy and liquidity behavior', () => {
       reserveRatio: 0.1,
       reserveMultiplier: 3,
       maxPaymentAmount: usdc('1'),
+      allowAllPayTo: true,
     });
     const payment = x402PaymentContext({ amount: usdc('1') });
 
@@ -187,6 +198,92 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     await expect(
       hooks.before?.(x402PaymentContext({ amount: usdc('0.000001') })),
     ).rejects.toMatchObject({ code: 'DIVIGENT_X402_SESSION_CAP_EXCEEDED' });
+  });
+
+  // Exercises: concurrent payment creation reserves session budget before liquidity awaits.
+  it('reserves the session payment cap across concurrent before hooks', async () => {
+    const { client, hooks } = createX402Client();
+    const divigent = createX402Divigent({
+      balances: [usdc('200'), usdc('200')],
+    });
+    attachDivigentYield(client as never, divigent, {
+      maxPaymentAmount: usdc('100'),
+      maxSessionPaymentAmount: usdc('100'),
+      minIdleThreshold: 0n,
+    });
+
+    const results = await Promise.allSettled([
+      hooks.before?.(x402PaymentContext({ amount: usdc('40') })),
+      hooks.before?.(x402PaymentContext({ amount: usdc('40') })),
+      hooks.before?.(x402PaymentContext({ amount: usdc('40') })),
+    ]);
+
+    const fulfilled = results.filter((result) => result.status === 'fulfilled');
+    const rejected = results.filter((result) => result.status === 'rejected');
+    expect(fulfilled).toHaveLength(2);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      reason: {
+        code: 'DIVIGENT_X402_SESSION_CAP_EXCEEDED',
+        category: 'policy',
+        context: {
+          sessionPaymentTotal: 0n,
+          sessionPaymentReserved: usdc('80'),
+          sessionPaymentCap: usdc('100'),
+        },
+      },
+    });
+    expect(divigent.usdcBalance).toHaveBeenCalledTimes(2);
+  });
+
+  // Exercises: reservations do not leak when the before hook abandons Divigent handling.
+  it('releases reserved session budget when before-hook liquidity work fails', async () => {
+    const { client, hooks } = createX402Client();
+    let balanceReads = 0;
+    const divigent = createX402Divigent({
+      usdcBalance: async () => {
+        balanceReads++;
+        if (balanceReads === 1) throw new Error('balance read failed');
+        return usdc('1');
+      },
+    });
+    attachDivigentYield(client as never, divigent, {
+      maxPaymentAmount: usdc('1'),
+      maxSessionPaymentAmount: usdc('1'),
+      minIdleThreshold: 0n,
+    });
+
+    await expect(
+      hooks.before?.(x402PaymentContext({ amount: usdc('1') })),
+    ).rejects.toMatchObject({
+      code: 'DIVIGENT_X402_BALANCE_UNAVAILABLE',
+      category: 'x402',
+      retryable: true,
+    });
+
+    await expect(
+      hooks.before?.(x402PaymentContext({ amount: usdc('1') })),
+    ).resolves.toBeUndefined();
+  });
+
+  // Exercises: failed downstream x402 payment creation releases the in-flight reservation.
+  it('releases reserved session budget on payment creation failure', async () => {
+    const { client, hooks } = createX402Client();
+    const divigent = createX402Divigent({ balances: [usdc('1'), usdc('1')] });
+    attachDivigentYield(client as never, divigent, {
+      maxPaymentAmount: usdc('1'),
+      maxSessionPaymentAmount: usdc('1'),
+      minIdleThreshold: 0n,
+    });
+
+    const first = x402PaymentContext({ amount: usdc('1') });
+    await hooks.before?.(first);
+    await hooks.failure?.(first);
+    await hooks.failure?.(first);
+
+    await expect(
+      hooks.before?.(x402PaymentContext({ amount: usdc('1') })),
+    ).resolves.toBeUndefined();
   });
 
   // Exercises: uses the tighter resource-specific payment cap before checking balances.
@@ -582,7 +679,7 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     await hooks.before?.(ctx);
     await hooks.failure?.(ctx);
 
-    expect(divigent.depositWithPermit).toHaveBeenCalledWith({
+    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
       amount: usdc('1.4'),
       wallet: OWNER,
     });
@@ -591,6 +688,33 @@ describe('x402 recall hook policy and liquidity behavior', () => {
       recalledUsdc: true,
       redepositAmount: usdc('1.4'),
       redepositTxHash: HASH_1,
+    }));
+  });
+
+  // Exercises: does not sweep unrelated USDC inflows that arrive during the recall window.
+  it('caps failure redeposit to the amount returned by recall', async () => {
+    const { client, hooks } = createX402Client();
+    const onPaymentFailure = vi.fn();
+    const divigent = createX402Divigent({
+      balances: [usdc('0.1'), usdc('1.5'), usdc('2')],
+      previewWithdrawNet: usdc('1.4'),
+    });
+    attachDivigentYield(client as never, divigent, {
+      minIdleThreshold: usdc('0.5'),
+      onPaymentFailure,
+    });
+    const ctx = x402PaymentContext({ amount: usdc('1') });
+
+    await hooks.before?.(ctx);
+    await hooks.failure?.(ctx);
+
+    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
+      amount: usdc('1.4'),
+      wallet: OWNER,
+    });
+    expect(onPaymentFailure).toHaveBeenCalledWith(expect.objectContaining({
+      recalledUsdc: true,
+      redepositAmount: usdc('1.4'),
     }));
   });
 
@@ -612,7 +736,7 @@ describe('x402 recall hook policy and liquidity behavior', () => {
     await hooks.before?.(ctx);
     await hooks.failure?.(ctx);
 
-    expect(divigent.depositWithPermit).toHaveBeenCalledWith({
+    expect(divigent.depositWithPermitAndWait).toHaveBeenCalledWith({
       amount: usdc('1.4'),
       wallet: OWNER,
     });

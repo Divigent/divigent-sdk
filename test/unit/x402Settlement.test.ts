@@ -390,8 +390,8 @@ describe('handleDivigentSettlement', () => {
     }));
   });
 
-  // Exercises: does not infer settlement reserve from arbitrary wallet-out logs without payTo policy.
-  it('requires allowedPayTo before using receipt transfer logs as settlement reserve', async () => {
+  // Exercises: receipt-backed reserves do not depend on trusting the settlement response payee.
+  it('derives settlement reserve from verified transfer logs without payTo policy', async () => {
     const transfer = transferLog(OWNER, SELLER, usdc('0.2'));
     const divigent = createIncomeDivigent({ balances: [usdc('12')] });
     Object.assign(divigent, {
@@ -415,9 +415,9 @@ describe('handleDivigentSettlement', () => {
     ).resolves.toBe(HASH_1);
 
     expect(onIdleDeposit).toHaveBeenCalledWith(expect.objectContaining({
-      idleAmount: usdc('11.75'),
+      idleAmount: usdc('11.55'),
+      settlementReserve: usdc('0.2'),
     }));
-    expect(onIdleDeposit.mock.calls[0]?.[0]).not.toHaveProperty('settlementReserve');
   });
 });
 

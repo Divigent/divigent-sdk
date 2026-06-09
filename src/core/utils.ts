@@ -150,6 +150,8 @@ export function rescaleDecimals(
 
 // ERC-4626 virtual-offset share math
 
+const ROUTER_VIRTUAL_OFFSET = 1_000_000n;
+
 /**
  * @notice Preview shares minted for an asset amount using the router's virtual-offset math.
  * @param assets Asset amount.
@@ -162,7 +164,8 @@ export function convertToShares(
   totalSupply: bigint,
   totalAssets: bigint,
 ): bigint {
-  return (assets * (totalSupply + 1n)) / (totalAssets + 1n);
+  return (assets * (totalSupply + ROUTER_VIRTUAL_OFFSET)) /
+    (totalAssets + ROUTER_VIRTUAL_OFFSET);
 }
 
 /**
@@ -177,7 +180,9 @@ export function convertToAssets(
   totalSupply: bigint,
   totalAssets: bigint,
 ): bigint {
-  return (shares * (totalAssets + 1n)) / (totalSupply + 1n);
+  const assets = (shares * (totalAssets + ROUTER_VIRTUAL_OFFSET)) /
+    (totalSupply + ROUTER_VIRTUAL_OFFSET);
+  return assets > totalAssets ? totalAssets : assets;
 }
 
 // Display formatter

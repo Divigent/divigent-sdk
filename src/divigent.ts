@@ -65,6 +65,7 @@ import type {
 } from './x402/types';
 import { withOwnerLock } from './x402/locks';
 import { parseDepositReceipt, parseWithdrawReceipt } from './core/receipts';
+import { sanitizeFeeOverrides } from './fees';
 import {
   approveUsdc,
   readUsdcAllowance,
@@ -244,8 +245,8 @@ export type DivigentConfig = {
   executor?: DivigentCallExecutor | undefined;
   /**
    * @notice Supported deployment chain.
-   * @remarks If omitted, the SDK infers from bound viem client chains when possible,
-   * then falls back to `base-sepolia` for backwards compatibility.
+   * @remarks If omitted, the SDK infers from bound viem client or executor
+   * chains. Bare clients must pass this explicitly.
    */
   chain?: DivigentChain | undefined;
   /** @notice Optional custom deployment addresses for private/test deployments. */
@@ -596,7 +597,8 @@ function withFeeOverrides(
   request: unknown,
   fees: FeeOverrides | undefined,
 ): DivigentWriteRequest {
-  return (fees ? { ...(request as object), ...fees } : request) as DivigentWriteRequest;
+  const sanitized = sanitizeFeeOverrides(fees);
+  return (sanitized ? { ...(request as object), ...sanitized } : request) as DivigentWriteRequest;
 }
 
 function sameAddress(a: EvmAddress, b: EvmAddress): boolean {
@@ -766,49 +768,20 @@ function approvalAmountWithDustBuffer(amount: bigint): bigint {
   return amount + 1n;
 }
 
-function errorText(error: unknown): string {
-  const parts: string[] = [];
-  const seen = new Set<unknown>();
-  let cur: unknown = error;
-  let depth = 0;
-  while (cur && depth < 16 && !seen.has(cur)) {
-    seen.add(cur);
-    if (cur instanceof Error) {
-      parts.push(cur.message);
-      const shortMessage = (cur as { shortMessage?: unknown }).shortMessage;
-      if (typeof shortMessage === 'string') parts.push(shortMessage);
-    } else if (typeof cur === 'string') {
-      parts.push(cur);
-    }
-    cur = (cur as { cause?: unknown }).cause;
-    depth++;
-  }
-  return parts.join('\n').toLowerCase();
-}
+const PERMIT_FALLBACK_ERROR_NAMES = new Set([
+  'InsufficientPermitAllowance',
+]);
+
+const PERMIT_FALLBACK_REASONS = new Set([
+  'ERC20: transfer amount exceeds allowance',
+]);
 
 function shouldFallbackPermitWriteToApproval(error: unknown): boolean {
-  if (error instanceof DivigentError) {
-    const errorName = error.context?.errorName;
-    if (errorName === 'InsufficientPermitAllowance') return true;
-    const reason = error.context?.reason;
-    if (
-      typeof reason === 'string' &&
-      reason.toLowerCase().includes('transfer amount exceeds allowance')
-    ) {
-      return true;
-    }
-  }
-
-  const text = errorText(error);
-  return (
-    text.includes('transfer amount exceeds allowance') ||
-    text.includes('erc20: insufficient allowance') ||
-    text.includes('erc20insufficientallowance') ||
-    text.includes('erc20 insufficient allowance') ||
-    text.includes('insufficient allowance') ||
-    text.includes('insufficientpermitallowance') ||
-    text.includes('insufficient permit allowance')
-  );
+  if (!(error instanceof DivigentError)) return false;
+  const errorName = error.context?.errorName;
+  if (typeof errorName === 'string' && PERMIT_FALLBACK_ERROR_NAMES.has(errorName)) return true;
+  const reason = error.context?.reason;
+  return typeof reason === 'string' && PERMIT_FALLBACK_REASONS.has(reason);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -835,7 +808,23 @@ function resolveChain(config: DivigentConfig): DivigentChain {
     throw new ChainMismatchError(CHAINS[walletChain].id, CHAINS[executorChain].id, 'executor');
   }
 
-  return publicChain ?? walletChain ?? executorChain ?? 'base-sepolia';
+  const inferred = publicChain ?? walletChain ?? executorChain;
+  if (inferred === undefined) {
+    throw new DivigentError(
+      '[@divigent/sdk] DivigentConfig.chain is required when clients are not bound to a supported Divigent chain',
+      {
+        code: 'DIVIGENT_CHAIN_REQUIRED',
+        category: 'config',
+        context: {
+          publicChainId,
+          walletChainId,
+          executorChainId,
+        },
+      },
+    );
+  }
+
+  return inferred;
 }
 
 function validateExecutor(executor: DivigentCallExecutor | undefined): DivigentCallExecutor | undefined {
@@ -1961,6 +1950,7 @@ export class Divigent {
   async planDeposit(params: DepositParams): Promise<DepositPlan> {
     const { account, owner, chain } = this.requireExecutionSigner();
     const wallet = params.wallet ?? owner;
+    await this.assertMinDepositAmount(params.amount);
     const previewShares = await this.previewDeposit(params.amount);
     const slippageBps = params.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
     const minSharesOut = params.minSharesOut ?? applySlippageDown(previewShares, slippageBps);
@@ -2036,7 +2026,7 @@ export class Divigent {
   async depositAndWait(params: DepositParams & WaitOptions): Promise<DepositResult> {
     const hash = await this.deposit(params);
     const receipt = await this.waitForReceipt(hash, params);
-    return parseDepositReceipt(receipt);
+    return parseDepositReceipt(receipt, this.addresses.router);
   }
 
   /**
@@ -2097,7 +2087,7 @@ export class Divigent {
   ): Promise<DepositResult> {
     const hash = await this.depositWithApproval(params);
     const receipt = await this.waitForReceipt(hash, params);
-    return parseDepositReceipt(receipt);
+    return parseDepositReceipt(receipt, this.addresses.router);
   }
 
   /**
@@ -2109,6 +2099,17 @@ export class Divigent {
    * @returns Transaction hash.
    */
   async depositWithPermit(params: DepositWithPermitParams): Promise<TxHash> {
+    const { hash } = await this.depositWithPermitQueued(params);
+    return hash;
+  }
+
+  private async depositWithPermitQueued(
+    params: DepositWithPermitParams,
+    waitOptions: WaitOptions = {},
+  ): Promise<{
+    hash: TxHash;
+    receipt?: Awaited<ReturnType<PublicClient['waitForTransactionReceipt']>>;
+  }> {
     const wallet = params.wallet ?? this.defaultWallet();
     const fallback = params.fallbackOnPermitUnsupported ?? params.fallbackOn7702 ?? true;
     await this.assertMinDepositAmount(params.amount);
@@ -2141,13 +2142,14 @@ export class Divigent {
           err instanceof PermitUnsupportedForTokenError
         );
         if (fallback && permitUnsupported) {
-          return this.depositViaApproval(params, wallet, minSharesOut);
+          const hash = await this.depositViaApproval(params, wallet, minSharesOut);
+          return { hash };
         }
         throw err;
       }
 
       try {
-        return await depositWithPermitWrite({
+        const hash = await depositWithPermitWrite({
           walletClient: this.requireWallet(),
           publicClient: this.publicClient,
           router: this.addresses.router,
@@ -2157,9 +2159,12 @@ export class Divigent {
           minSharesOut,
           ...(params.fees && { fees: params.fees }),
         });
+        const receipt = await this.waitForReceipt(hash, waitOptions);
+        return { hash, receipt };
       } catch (err) {
         if (fallback && shouldFallbackPermitWriteToApproval(err)) {
-          return this.depositViaApproval(params, wallet, minSharesOut);
+          const hash = await this.depositViaApproval(params, wallet, minSharesOut);
+          return { hash };
         }
         throw err;
       }
@@ -2172,9 +2177,9 @@ export class Divigent {
    * @returns Parsed deposit result.
    */
   async depositWithPermitAndWait(params: DepositWithPermitParams & WaitOptions): Promise<DepositResult> {
-    const hash = await this.depositWithPermit(params);
-    const receipt = await this.waitForReceipt(hash, params);
-    return parseDepositReceipt(receipt);
+    const { hash, receipt: queuedReceipt } = await this.depositWithPermitQueued(params, params);
+    const receipt = queuedReceipt ?? await this.waitForReceipt(hash, params);
+    return parseDepositReceipt(receipt, this.addresses.router);
   }
 
   /**
@@ -2428,7 +2433,7 @@ export class Divigent {
   async withdrawAndWait(params: WithdrawParams & WaitOptions): Promise<WithdrawResult> {
     const hash = await this.withdraw(params);
     const receipt = await this.waitForReceipt(hash, params);
-    return parseWithdrawReceipt(receipt);
+    return parseWithdrawReceipt(receipt, this.addresses.router);
   }
 
   // Governance writes

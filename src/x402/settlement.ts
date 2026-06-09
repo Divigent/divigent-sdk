@@ -96,7 +96,6 @@ async function settlementDebitReserve(
     }
 
     const allowedPayTo = new Set((options.config?.allowedPayTo ?? []).map((addr) => addr.toLowerCase()));
-    if (allowedPayTo.size === 0) return responseReserve;
     const transfers = parseEventLogs({
       abi: usdcAbi,
       logs: receipt.logs as Parameters<typeof parseEventLogs>[0]['logs'],

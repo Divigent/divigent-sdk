@@ -24,7 +24,7 @@ import {
   runWrite,
   toDivigentError,
 } from '../../src/errors';
-import { HASH_1, OWNER, usdc } from './helpers';
+import { HASH_1, OWNER, addresses, usdc } from './helpers';
 
 type AbiError = {
   type: 'error';
@@ -51,6 +51,7 @@ function sampleArg(type: string): unknown {
 function receiptWithLog(log: {
   topics: readonly `0x${string}`[];
   data: `0x${string}`;
+  address?: `0x${string}`;
 }): TransactionReceipt {
   return receiptWithLogs([log]);
 }
@@ -58,12 +59,13 @@ function receiptWithLog(log: {
 function receiptWithLogs(logs: Array<{
   topics: readonly `0x${string}`[];
   data: `0x${string}`;
+  address?: `0x${string}`;
 }>): TransactionReceipt {
   return {
     transactionHash: HASH_1,
     logs: logs.map((log, index) => ({
       ...log,
-      address: `0x100000000000000000000000000000000000000${index + 1}`,
+      address: log.address ?? `0x100000000000000000000000000000000000000${index + 1}`,
     })),
   } as unknown as TransactionReceipt;
 }
@@ -130,6 +132,52 @@ describe('receipt parsing', () => {
     ]))).toEqual({
       txHash: HASH_1,
       sharesMinted: 990n,
+    });
+  });
+  // Exercises: same-signature events from foreign contracts cannot spoof router results.
+  it('filters receipt events by router emitter when provided', () => {
+    const depositTopics = encodeEventTopics({
+      abi: routerAbi,
+      eventName: 'Deposited',
+      args: { wallet: OWNER, vaultType: 1 },
+    });
+    const spoofedDepositData = encodeAbiParameters(
+      [{ type: 'uint256' }, { type: 'uint256' }],
+      [usdc('0.001'), 1n],
+    );
+    const routerDepositData = encodeAbiParameters(
+      [{ type: 'uint256' }, { type: 'uint256' }],
+      [usdc('0.001'), 990n],
+    );
+    const withdrawnTopics = encodeEventTopics({
+      abi: routerAbi,
+      eventName: 'Withdrawn',
+      args: { wallet: OWNER },
+    });
+    const spoofedWithdrawData = encodeAbiParameters(
+      [{ type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }],
+      [500n, 1n, 0n, 0n],
+    );
+    const routerWithdrawData = encodeAbiParameters(
+      [{ type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }],
+      [500n, usdc('0.000490'), usdc('0.000010'), usdc('0.000001')],
+    );
+
+    const foreign = '0x2000000000000000000000000000000000000001' as const;
+
+    expect(parseDepositReceipt(receiptWithLogs([
+      { address: foreign, topics: depositTopics as `0x${string}`[], data: spoofedDepositData },
+      { address: addresses.router, topics: depositTopics as `0x${string}`[], data: routerDepositData },
+    ]), addresses.router)).toEqual({
+      txHash: HASH_1,
+      sharesMinted: 990n,
+    });
+    expect(parseWithdrawReceipt(receiptWithLogs([
+      { address: foreign, topics: withdrawnTopics as `0x${string}`[], data: spoofedWithdrawData },
+      { address: addresses.router, topics: withdrawnTopics as `0x${string}`[], data: routerWithdrawData },
+    ]), addresses.router)).toEqual({
+      txHash: HASH_1,
+      usdcReturned: usdc('0.000490'),
     });
   });
   // Exercises: throws typed receipt errors when expected events are missing.

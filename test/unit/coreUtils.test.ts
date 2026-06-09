@@ -88,11 +88,12 @@ describe('core utils', () => {
   // Exercises: matches the router virtual-offset share math.
   it('matches the router virtual-offset share math', () => {
     expect(convertToShares(1_000n, 10_000n, 20_000n)).toBe(
-      (1_000n * 10_001n) / 20_001n,
+      (1_000n * 1_010_000n) / 1_020_000n,
     );
     expect(convertToAssets(500n, 10_000n, 20_000n)).toBe(
-      (500n * 20_001n) / 10_001n,
+      (500n * 1_020_000n) / 1_010_000n,
     );
+    expect(convertToAssets(2_000_000n, 1_000_000n, 1n)).toBe(1n);
   });
   // Exercises: formats display strings with trimming and truncation.
   it('formats display strings with trimming and truncation', () => {

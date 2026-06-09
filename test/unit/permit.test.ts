@@ -3,6 +3,7 @@ import { ContractFunctionRevertedError, encodeErrorResult, hashTypedData } from 
 import { routerAbi } from '../../src/abis';
 import { signUsdcPermit } from '../../src/contracts/usdc';
 import {
+  DivigentError,
   PermitUnsupportedFor7702AccountError,
   PermitUnsupportedForTokenError,
 } from '../../src/errors';
@@ -254,13 +255,13 @@ describe('USDC permit signing', () => {
       },
     }));
   });
-  // Exercises: uses an explicit permit owner instead of silently signing for the wallet account.
-  it('uses an explicit permit owner instead of silently signing for the wallet account', async () => {
+  // Exercises: rejects explicit permit owners that do not match the wallet signer.
+  it('rejects explicit permit owners that do not match the wallet signer', async () => {
     const { publicClient, walletClient, signTypedData } = createMockClients({
       signTypedData: () => lowSSignature(),
     });
 
-    await signUsdcPermit({
+    await expect(signUsdcPermit({
       walletClient,
       publicClient,
       usdc: addresses.usdc,
@@ -268,15 +269,8 @@ describe('USDC permit signing', () => {
       value: usdc('0.001'),
       deadline: 2_000n,
       owner: SECOND_OWNER,
-    });
-
-    expect(signTypedData).toHaveBeenCalledWith(expect.objectContaining({
-      message: expect.objectContaining({
-        owner: SECOND_OWNER,
-        spender: addresses.router,
-        value: usdc('0.001'),
-      }),
-    }));
+    })).rejects.toMatchObject({ code: 'DIVIGENT_PERMIT_OWNER_MISMATCH' });
+    expect(signTypedData).not.toHaveBeenCalled();
   });
   // Exercises: rejects unexpected v values.
   it('rejects unexpected v values', async () => {
@@ -500,13 +494,13 @@ describe('depositWithPermit behavior', () => {
     ).rejects.toBeInstanceOf(PermitUnsupportedForTokenError);
     expect(writeContract).not.toHaveBeenCalled();
   });
-  // Exercises: fallback does not silently approve signer funds for a different credited wallet.
-  it('rejects permit fallback when the deposit wallet differs from the signer', async () => {
+  // Exercises: permit flow rejects a credited wallet that differs from the signer.
+  it('rejects permit deposits when the credited wallet differs from the signer', async () => {
     const { divigent, writeContract } = createDivigentWithClients({ getCode: '0x1234' });
 
     await expect(
       divigent.depositWithPermit({ amount: usdc('0.001'), wallet: SECOND_OWNER }),
-    ).rejects.toMatchObject({ code: 'DIVIGENT_PERMIT_FALLBACK_OWNER_MISMATCH' });
+    ).rejects.toMatchObject({ code: 'DIVIGENT_PERMIT_OWNER_MISMATCH' });
     expect(writeContract).not.toHaveBeenCalled();
   });
   // Exercises: falls back when a permit signature is accepted locally but router simulation
@@ -565,11 +559,8 @@ describe('depositWithPermit behavior', () => {
     expect(waitForTransactionReceipt).toHaveBeenCalledWith({ hash: HASH_1 });
     expect(writeContract).toHaveBeenCalledTimes(2);
   });
-  // Exercises: supports common ERC20 allowance revert text variants from non-Divigent tokens.
-  it.each([
-    'ERC20: insufficient allowance',
-    'ERC20InsufficientAllowance(address,uint256,uint256)',
-  ])('falls back to approval deposit when permit execution reports %s', async (message) => {
+  // Exercises: permits fallback only from structured SDK-normalized revert metadata.
+  it('falls back to approval deposit when permit execution has a structured allowance reason', async () => {
     const amount = usdc('0.001');
     const allowances = [0n, amount + 1n];
     const { divigent, simulateContract, writeContract } = createDivigentWithClients({
@@ -585,7 +576,13 @@ describe('depositWithPermit behavior', () => {
         throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
       },
       simulateContract: (request) => {
-        if (request.functionName === 'depositWithPermit') throw new Error(message);
+        if (request.functionName === 'depositWithPermit') {
+          throw new DivigentError('Contract revert: ERC20: transfer amount exceeds allowance', {
+            code: 'DIVIGENT_REQUIRE_REVERT',
+            category: 'contract',
+            context: { reason: 'ERC20: transfer amount exceeds allowance' },
+          });
+        }
         if (request.functionName === 'approve') {
           return { request: { ...request, gas: 111n }, result: true };
         }
@@ -603,6 +600,41 @@ describe('depositWithPermit behavior', () => {
       'deposit',
     ]);
     expect(writeContract).toHaveBeenCalledTimes(2);
+  });
+  // Exercises: malicious or incidental free-form allowance text cannot trigger approval fallback.
+  it.each([
+    ['raw message', () => new Error('ERC20: insufficient allowance')],
+    ['nested cause', () => {
+      const err = new Error('upstream RPC failed');
+      (err as { cause?: unknown }).cause = new Error('ERC20InsufficientAllowance(address,uint256,uint256)');
+      return err;
+    }],
+  ])('does not fall back to approval deposit for %s allowance text', async (_label, makeError) => {
+    const amount = usdc('0.001');
+    const { divigent, simulateContract, writeContract } = createDivigentWithClients({
+      signTypedData: () => lowSSignature(),
+      writeHashes: [HASH_1, HASH_2],
+      readContract: (request) => {
+        if (request.functionName === 'previewDeposit') return 1_000_000n;
+        if (request.functionName === 'MIN_DEPOSIT') return 0n;
+        if (request.functionName === 'name') return 'USD Coin';
+        if (request.functionName === 'version') return '2';
+        if (request.functionName === 'nonces') return 7n;
+        throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+      },
+      simulateContract: (request) => {
+        if (request.functionName === 'depositWithPermit') throw makeError();
+        throw new Error(`Unhandled simulateContract function ${String(request.functionName)}`);
+      },
+    });
+
+    await expect(divigent.depositWithPermit({ amount })).rejects.toMatchObject({
+      code: 'DIVIGENT_WRITE_FAILED',
+    });
+    expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual([
+      'depositWithPermit',
+    ]);
+    expect(writeContract).not.toHaveBeenCalled();
   });
   // Exercises: unrelated router reverts propagate instead of being hidden by approval fallback.
   it('does not fall back to approval deposit for unrelated permit execution reverts', async () => {

@@ -31,7 +31,15 @@ function reserveFloor(config: ReserveFloorConfig): ReserveFloor {
 function createProtocolMinDeposit(divigent: Divigent): () => Promise<bigint> {
   let minDepositPromise: Promise<bigint> | undefined;
   return () => {
-    minDepositPromise ??= divigent.minDeposit();
+    if (minDepositPromise === undefined) {
+      const pending = divigent.minDeposit();
+      minDepositPromise = pending;
+      void pending.catch(() => {
+        if (minDepositPromise === pending) {
+          minDepositPromise = undefined;
+        }
+      });
+    }
     return minDepositPromise;
   };
 }

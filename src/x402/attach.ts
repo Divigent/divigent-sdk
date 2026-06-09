@@ -49,9 +49,22 @@ const RECALL_BALANCE_POLL_MS = 2_000;
 
 type PaymentCtx = PaymentCreationContext | X402PaymentCreatedContext;
 type NonFatalInput = Omit<IntegrationErrorContext, 'error'> & { error: unknown };
+type HookFn = BeforePaymentCreationHook | AfterPaymentCreationHook | OnPaymentCreationFailureHook;
 
 // Track attached clients to prevent double hook registration.
 const attachedClients = new WeakSet<x402Client>();
+
+type RemovableX402Client = {
+  off?: (event: string, hook: HookFn) => unknown;
+  removeListener?: (event: string, hook: HookFn) => unknown;
+  removeEventListener?: (event: string, hook: HookFn) => unknown;
+  offBeforePaymentCreation?: (hook: BeforePaymentCreationHook) => unknown;
+  offAfterPaymentCreation?: (hook: AfterPaymentCreationHook) => unknown;
+  offPaymentCreationFailure?: (hook: OnPaymentCreationFailureHook) => unknown;
+  beforePaymentCreationHooks?: BeforePaymentCreationHook[];
+  afterPaymentCreationHooks?: AfterPaymentCreationHook[];
+  onPaymentCreationFailureHooks?: OnPaymentCreationFailureHook[];
+};
 
 /**
  * @notice EMA-based reserve sizer used to keep payment liquidity in the wallet.
@@ -153,6 +166,7 @@ export function attachX402HooksWithReserveFloor(
 
   let detached = false;
   let sessionPaymentTotal = 0n;
+  let sessionPaymentReserved = 0n;
   const redact = config.redact ?? false;
 
   const redactAddr = (a: EvmAddress): EvmAddress | string =>
@@ -164,9 +178,36 @@ export function attachX402HooksWithReserveFloor(
     owner: EvmAddress;
     recallShares: bigint;
     balanceBefore: bigint;
+    recalledUsdc: bigint;
   };
   const recallByRequired = new WeakMap<object, RecallState>();
   const handledByRequired = new WeakSet<object>();
+  const sessionReservationByRequired = new WeakMap<object, bigint>();
+
+  const sessionPaymentInUse = (): bigint => sessionPaymentTotal + sessionPaymentReserved;
+
+  const reserveSessionPayment = (key: object, amount: bigint): void => {
+    if (config.maxSessionPaymentAmount === undefined || sessionReservationByRequired.has(key)) return;
+    sessionReservationByRequired.set(key, amount);
+    sessionPaymentReserved += amount;
+  };
+
+  const releaseSessionPayment = (key: object): void => {
+    const amount = sessionReservationByRequired.get(key);
+    if (amount === undefined) return;
+    sessionReservationByRequired.delete(key);
+    sessionPaymentReserved -= amount;
+    if (sessionPaymentReserved < 0n) sessionPaymentReserved = 0n;
+  };
+
+  const commitSessionPayment = (key: object): void => {
+    const amount = sessionReservationByRequired.get(key);
+    if (amount === undefined) return;
+    sessionReservationByRequired.delete(key);
+    sessionPaymentReserved -= amount;
+    if (sessionPaymentReserved < 0n) sessionPaymentReserved = 0n;
+    sessionPaymentTotal += amount;
+  };
 
   const wallet = (): EvmAddress => {
     const wc = divigent.walletClient;
@@ -225,12 +266,13 @@ export function attachX402HooksWithReserveFloor(
         },
       });
     }
+    const sessionPaymentUsed = sessionPaymentInUse();
     if (
       config.maxSessionPaymentAmount !== undefined &&
-      sessionPaymentTotal + paymentAmount > config.maxSessionPaymentAmount
+      sessionPaymentUsed + paymentAmount > config.maxSessionPaymentAmount
     ) {
-      const remaining = config.maxSessionPaymentAmount > sessionPaymentTotal
-        ? config.maxSessionPaymentAmount - sessionPaymentTotal
+      const remaining = config.maxSessionPaymentAmount > sessionPaymentUsed
+        ? config.maxSessionPaymentAmount - sessionPaymentUsed
         : 0n;
       throw new PaymentCapExceededError(paymentAmount, remaining, {
         code: 'DIVIGENT_X402_SESSION_CAP_EXCEEDED',
@@ -238,6 +280,7 @@ export function attachX402HooksWithReserveFloor(
         context: {
           paymentAmount,
           sessionPaymentTotal,
+          sessionPaymentReserved,
           sessionPaymentCap: config.maxSessionPaymentAmount,
           resource: policy.resource,
           payTo: policy.payTo,
@@ -246,11 +289,30 @@ export function attachX402HooksWithReserveFloor(
     }
     const key = raw.paymentRequired as object;
     handledByRequired.add(key);
+    reserveSessionPayment(key, paymentAmount);
 
     try {
       await withOwnerLock(owner, async () => {
         const floor = reserveFloor.required();
-        const balance = await divigent.usdcBalance(owner);
+        let balance: bigint;
+        try {
+          balance = await divigent.usdcBalance(owner);
+        } catch (err) {
+          throw new DivigentError(
+            '[@divigent/sdk] x402 could not read wallet USDC balance before payment',
+            {
+              cause: err,
+              code: 'DIVIGENT_X402_BALANCE_UNAVAILABLE',
+              category: 'x402',
+              retryable: true,
+              context: {
+                wallet: owner,
+                paymentAmount,
+                reserveFloor: floor,
+              },
+            },
+          );
+        }
         const needed = paymentAmount + floor;
         const deficit = balance >= needed ? 0n : needed - balance;
         let liquidBalance = balance;
@@ -274,7 +336,12 @@ export function attachX402HooksWithReserveFloor(
               liquidBalance = needed;
               recallByRequired.set(
                 raw.paymentRequired as object,
-                { owner, recallShares: sharesNeeded, balanceBefore: balance },
+                {
+                  owner,
+                  recallShares: sharesNeeded,
+                  balanceBefore: balance,
+                  recalledUsdc: recalled.usdcReturned,
+                },
               );
             }
           } catch (err) {
@@ -322,9 +389,13 @@ export function attachX402HooksWithReserveFloor(
       });
     } catch (err) {
       handledByRequired.delete(key);
+      releaseSessionPayment(key);
       if (
         isDivigentError(err) &&
-        err.code === 'DIVIGENT_X402_RECALL_INSUFFICIENT_LIQUIDITY'
+        (
+          err.code === 'DIVIGENT_X402_RECALL_INSUFFICIENT_LIQUIDITY' ||
+          err.code === 'DIVIGENT_X402_BALANCE_UNAVAILABLE'
+        )
       ) {
         throw err;
       }
@@ -354,7 +425,7 @@ export function attachX402HooksWithReserveFloor(
     const owner = wallet();
     await withOwnerLock(owner, async () => {
       reserveFloor.recordPayment(paymentAmount, paymentCap);
-      sessionPaymentTotal += paymentAmount;
+      commitSessionPayment(key);
 
       recallByRequired.delete(key);
       handledByRequired.delete(key);
@@ -386,6 +457,7 @@ export function attachX402HooksWithReserveFloor(
   const failureHook: OnPaymentCreationFailureHook = async (raw) => {
     if (detached) return;
     const key = raw.paymentRequired as object;
+    releaseSessionPayment(key);
     const state = recallByRequired.get(key);
     const wasHandled = state !== undefined || handledByRequired.has(key);
     recallByRequired.delete(key);
@@ -401,15 +473,17 @@ export function attachX402HooksWithReserveFloor(
         await withOwnerLock(state.owner, async () => {
           const balance = await divigent.usdcBalance(state.owner);
           const excess = balance > state.balanceBefore ? balance - state.balanceBefore : 0n;
-          if (excess > 0n) {
+          const redepositable = excess > state.recalledUsdc ? state.recalledUsdc : excess;
+          if (redepositable > 0n) {
             try {
-              redepositAmount = excess;
-              redepositTxHash = divigent.executor
-                ? await divigent.depositWithApproval({ amount: excess, wallet: state.owner })
-                : await divigent.depositWithPermit({
-                  amount: excess,
+              redepositAmount = redepositable;
+              const redeposit = divigent.executor
+                ? await divigent.depositWithApprovalAndWait({ amount: redepositable, wallet: state.owner })
+                : await divigent.depositWithPermitAndWait({
+                  amount: redepositable,
                   wallet: state.owner,
                 });
+              redepositTxHash = redeposit.txHash;
             } catch (_err) {
               // Redeposit failed; USDC remains liquid in the wallet.
               await reportNonFatal(config.onNonFatalError, {
@@ -453,9 +527,58 @@ export function attachX402HooksWithReserveFloor(
   return {
     detach(): void {
       detached = true;
+      unregisterX402Hooks(client, beforeHook, afterHook, failureHook);
       attachedClients.delete(client);
     },
   };
+}
+
+function unregisterX402Hooks(
+  client: x402Client,
+  beforeHook: BeforePaymentCreationHook,
+  afterHook: AfterPaymentCreationHook,
+  failureHook: OnPaymentCreationFailureHook,
+): void {
+  const removable = client as unknown as RemovableX402Client;
+
+  callHookRemover(() => removable.offBeforePaymentCreation?.(beforeHook));
+  callHookRemover(() => removable.offAfterPaymentCreation?.(afterHook));
+  callHookRemover(() => removable.offPaymentCreationFailure?.(failureHook));
+
+  removeEmitterHook(removable, ['beforePaymentCreation', 'beforePaymentCreationHook'], beforeHook);
+  removeEmitterHook(removable, ['afterPaymentCreation', 'afterPaymentCreationHook'], afterHook);
+  removeEmitterHook(removable, ['paymentCreationFailure', 'paymentCreationFailureHook'], failureHook);
+
+  removeHookFromArray(removable.beforePaymentCreationHooks, beforeHook);
+  removeHookFromArray(removable.afterPaymentCreationHooks, afterHook);
+  removeHookFromArray(removable.onPaymentCreationFailureHooks, failureHook);
+}
+
+function removeEmitterHook(
+  client: RemovableX402Client,
+  eventNames: readonly string[],
+  hook: HookFn,
+): void {
+  for (const eventName of eventNames) {
+    callHookRemover(() => client.off?.(eventName, hook));
+    callHookRemover(() => client.removeListener?.(eventName, hook));
+    callHookRemover(() => client.removeEventListener?.(eventName, hook));
+  }
+}
+
+function callHookRemover(fn: () => unknown): void {
+  try {
+    fn();
+  } catch {
+    // Detach should remain best-effort; the detached guard still prevents execution.
+  }
+}
+
+function removeHookFromArray<T>(hooks: T[] | undefined, hook: T): void {
+  if (!hooks) return;
+  const next = hooks.filter((registered) => registered !== hook);
+  hooks.length = 0;
+  hooks.push(...next);
 }
 
 function ctxAmount(ctx: PaymentCtx): bigint {
@@ -547,7 +670,13 @@ function escapeRegex(value: string): string {
 }
 
 function resourceMatches(pattern: X402ResourcePattern, value: string): boolean {
-  if (pattern instanceof RegExp) return pattern.test(value);
+  if (pattern instanceof RegExp) {
+    const previousLastIndex = pattern.lastIndex;
+    pattern.lastIndex = 0;
+    const matches = pattern.test(value);
+    pattern.lastIndex = previousLastIndex;
+    return matches;
+  }
   if (pattern.includes('*')) {
     const regex = new RegExp(`^${pattern.split('*').map(escapeRegex).join('.*')}$`);
     return regex.test(value);
@@ -562,10 +691,11 @@ function matchesAny(patterns: readonly X402ResourcePattern[], value: string | un
 }
 
 function matchesAllowedPayTo(
-  allowedPayTo: readonly string[] | undefined,
+  config: X402WrapConfig,
   payTo: string | undefined,
 ): boolean {
-  if (!allowedPayTo || allowedPayTo.length === 0) return true;
+  const allowedPayTo = config.allowedPayTo;
+  if (!allowedPayTo || allowedPayTo.length === 0) return config.allowAllPayTo === true;
   if (!payTo) return false;
   const normalized = payTo.toLowerCase();
   return allowedPayTo.some((addr) => addr.toLowerCase() === normalized);
@@ -632,7 +762,7 @@ async function shouldHandlePaymentByPolicy(
   config: X402WrapConfig,
   ctx: X402PolicyContext,
 ): Promise<boolean> {
-  if (!matchesAllowedPayTo(config.allowedPayTo, ctx.payTo)) return false;
+  if (!matchesAllowedPayTo(config, ctx.payTo)) return false;
   if (!matchesAny(resourcePatterns(config), ctx.resource)) return false;
 
   const origins = originPatterns(config);
