@@ -3,7 +3,7 @@
 Viem-native TypeScript SDK for the Divigent yield router on Base mainnet and
 Base Sepolia.
 
-Current release line: `1.0.3`.
+Current release line: `1.0.5`.
 
 ## Mainnet Notice
 
@@ -14,7 +14,7 @@ and test on Base Sepolia or a Base fork before moving meaningful funds.
 ## Install
 
 ```bash
-npm install @divigent/sdk@^1.0.3 viem @x402/core
+npm install @divigent/sdk@^1.0.5 viem @x402/core
 ```
 
 Requires Node.js 20.10 or newer.
