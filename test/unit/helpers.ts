@@ -58,6 +58,7 @@ export type MockClientOptions = {
   readContract?: ((request: Record<string, unknown>) => unknown | Promise<unknown>) | undefined;
   simulateContract?: ((request: Record<string, unknown>) => unknown | Promise<unknown>) | undefined;
   signTypedData?: ((request: Record<string, unknown>) => Hex | Promise<Hex>) | undefined;
+  waitForTransactionReceipt?: ((request: { hash: TxHash }) => unknown | Promise<unknown>) | undefined;
   writeHashes?: readonly TxHash[] | undefined;
 };
 
@@ -138,10 +139,15 @@ export function createMockClients(opts: MockClientOptions = {}): MockClients {
 
   const getCode = vi.fn(async () => opts.getCode ?? '0x');
   const getBlock = vi.fn(async () => ({ timestamp: opts.blockTimestamp ?? 1_000n }));
-  const waitForTransactionReceipt = vi.fn(async ({ hash }: { hash: TxHash }) => ({
-    transactionHash: hash,
-    logs: [],
-  }));
+  const waitForTransactionReceipt = vi.fn(async ({ hash }: { hash: TxHash }) => {
+    if (opts.waitForTransactionReceipt) {
+      return opts.waitForTransactionReceipt({ hash });
+    }
+    return {
+      transactionHash: hash,
+      logs: [],
+    };
+  });
 
   const publicClient = {
     chain: opts.publicChainId === undefined

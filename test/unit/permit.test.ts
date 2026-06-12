@@ -254,13 +254,13 @@ describe('USDC permit signing', () => {
       },
     }));
   });
-  // Exercises: uses an explicit permit owner instead of silently signing for the wallet account.
-  it('uses an explicit permit owner instead of silently signing for the wallet account', async () => {
+  // Exercises: rejects owner overrides that cannot be signed by the connected account.
+  it('rejects a permit owner that differs from the wallet signer', async () => {
     const { publicClient, walletClient, signTypedData } = createMockClients({
       signTypedData: () => lowSSignature(),
     });
 
-    await signUsdcPermit({
+    await expect(signUsdcPermit({
       walletClient,
       publicClient,
       usdc: addresses.usdc,
@@ -268,15 +268,24 @@ describe('USDC permit signing', () => {
       value: usdc('0.001'),
       deadline: 2_000n,
       owner: SECOND_OWNER,
-    });
+    })).rejects.toMatchObject({ code: 'DIVIGENT_PERMIT_OWNER_MISMATCH' });
 
-    expect(signTypedData).toHaveBeenCalledWith(expect.objectContaining({
-      message: expect.objectContaining({
-        owner: SECOND_OWNER,
-        spender: addresses.router,
-        value: usdc('0.001'),
-      }),
-    }));
+    expect(signTypedData).not.toHaveBeenCalled();
+  });
+  // Exercises: rejects expired or near-expired permit deadlines before prompting the wallet.
+  it('rejects too-soon permit deadlines before signing', async () => {
+    const { publicClient, walletClient, signTypedData } = createMockClients();
+
+    await expect(signUsdcPermit({
+      walletClient,
+      publicClient,
+      usdc: addresses.usdc,
+      spender: addresses.router,
+      value: usdc('0.001'),
+      deadline: 1_000n,
+    })).rejects.toMatchObject({ code: 'DIVIGENT_SIGNATURE_DEADLINE_TOO_SOON' });
+
+    expect(signTypedData).not.toHaveBeenCalled();
   });
   // Exercises: rejects unexpected v values.
   it('rejects unexpected v values', async () => {
@@ -366,6 +375,39 @@ describe('initializeFor signing', () => {
       code: 'DIVIGENT_EIP712_DOMAIN_MISMATCH',
       context: { field: 'verifyingContract' },
     });
+    expect(signTypedData).not.toHaveBeenCalled();
+  });
+  // Exercises: normalizes InitializeFor signatures to the low-s form accepted by the router.
+  it('normalizes high-s InitializeFor signatures', async () => {
+    const { divigent } = createDivigentWithClients({
+      signTypedData: () => highSSignature(27),
+      readContract: (request) => {
+        if (request.functionName === 'eip712Domain') {
+          return ['0x0f', 'DivigentVaultRouter', '1', 84532n, addresses.router, '0x00', []];
+        }
+        if (request.functionName === 'nonces') return 7n;
+        throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
+      },
+    });
+
+    const signature = await divigent.signInitializeFor({
+      wallet: OWNER,
+      deadline: 2_000n,
+    });
+
+    expect(signature.slice(2, 66)).toBe('0'.repeat(63) + '1');
+    expect(signature.slice(66, 130)).toBe('0'.repeat(63) + '1');
+    expect(signature.slice(130, 132)).toBe('1c');
+  });
+  // Exercises: rejects expired or near-expired InitializeFor deadlines before signing.
+  it('rejects too-soon InitializeFor deadlines before signing', async () => {
+    const { divigent, signTypedData } = createDivigentWithClients();
+
+    await expect(divigent.signInitializeFor({
+      wallet: OWNER,
+      deadline: 1_000n,
+    })).rejects.toMatchObject({ code: 'DIVIGENT_SIGNATURE_DEADLINE_TOO_SOON' });
+
     expect(signTypedData).not.toHaveBeenCalled();
   });
 });
@@ -506,7 +548,7 @@ describe('depositWithPermit behavior', () => {
 
     await expect(
       divigent.depositWithPermit({ amount: usdc('0.001'), wallet: SECOND_OWNER }),
-    ).rejects.toMatchObject({ code: 'DIVIGENT_PERMIT_FALLBACK_OWNER_MISMATCH' });
+    ).rejects.toMatchObject({ code: 'DIVIGENT_PERMIT_OWNER_MISMATCH' });
     expect(writeContract).not.toHaveBeenCalled();
   });
   // Exercises: falls back when a permit signature is accepted locally but router simulation
@@ -565,44 +607,27 @@ describe('depositWithPermit behavior', () => {
     expect(waitForTransactionReceipt).toHaveBeenCalledWith({ hash: HASH_1 });
     expect(writeContract).toHaveBeenCalledTimes(2);
   });
-  // Exercises: supports common ERC20 allowance revert text variants from non-Divigent tokens.
+  // Exercises: raw ERC20 allowance text is not trusted for approval fallback.
   it.each([
     'ERC20: insufficient allowance',
     'ERC20InsufficientAllowance(address,uint256,uint256)',
-  ])('falls back to approval deposit when permit execution reports %s', async (message) => {
+  ])('does not fall back to approval deposit when permit execution reports %s', async (message) => {
     const amount = usdc('0.001');
-    const allowances = [0n, amount + 1n];
     const { divigent, simulateContract, writeContract } = createDivigentWithClients({
       signTypedData: () => lowSSignature(),
-      writeHashes: [HASH_1, HASH_2],
-      readContract: (request) => {
-        if (request.functionName === 'previewDeposit') return 1_000_000n;
-        if (request.functionName === 'MIN_DEPOSIT') return 0n;
-        if (request.functionName === 'name') return 'USD Coin';
-        if (request.functionName === 'version') return '2';
-        if (request.functionName === 'nonces') return 7n;
-        if (request.functionName === 'allowance') return allowances.shift() ?? amount + 1n;
-        throw new Error(`Unhandled readContract function ${String(request.functionName)}`);
-      },
       simulateContract: (request) => {
         if (request.functionName === 'depositWithPermit') throw new Error(message);
-        if (request.functionName === 'approve') {
-          return { request: { ...request, gas: 111n }, result: true };
-        }
-        if (request.functionName === 'deposit') {
-          return { request: { ...request, gas: 222n }, result: 900_000n };
-        }
         throw new Error(`Unhandled simulateContract function ${String(request.functionName)}`);
       },
     });
 
-    await expect(divigent.depositWithPermit({ amount })).resolves.toBe(HASH_2);
+    await expect(divigent.depositWithPermit({ amount })).rejects.toMatchObject({
+      code: 'DIVIGENT_WRITE_FAILED',
+    });
     expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual([
       'depositWithPermit',
-      'approve',
-      'deposit',
     ]);
-    expect(writeContract).toHaveBeenCalledTimes(2);
+    expect(writeContract).not.toHaveBeenCalled();
   });
   // Exercises: unrelated router reverts propagate instead of being hidden by approval fallback.
   it('does not fall back to approval deposit for unrelated permit execution reverts', async () => {
@@ -641,33 +666,46 @@ describe('depositWithPermit behavior', () => {
     ]);
     expect(writeContract).not.toHaveBeenCalled();
   });
-  // Exercises: surfaces PermitExpired from router permit-deposit simulation.
-  it('surfaces PermitExpired from router permit-deposit simulation', async () => {
-    const data = encodeErrorResult({
-      abi: routerAbi,
-      errorName: 'PermitExpired',
-    });
-    const { divigent } = createDivigentWithClients({
+  // Exercises: malicious or incidental RPC text cannot trigger approval fallback.
+  it('does not fall back to approval deposit based on free-form error text', async () => {
+    const amount = usdc('0.001');
+    const { divigent, simulateContract, writeContract } = createDivigentWithClients({
       signTypedData: () => lowSSignature(),
       simulateContract: (request) => {
         if (request.functionName === 'depositWithPermit') {
-          throw new ContractFunctionRevertedError({
-            abi: routerAbi,
-            data,
-            functionName: 'depositWithPermit',
-          });
+          throw new Error(
+            'malicious RPC text: insufficient allowance; transfer amount exceeds allowance',
+          );
         }
         throw new Error(`Unhandled simulateContract function ${String(request.functionName)}`);
       },
     });
 
     await expect(divigent.depositWithPermit({
-      amount: usdc('0.001'),
-      deadline: 1n,
+      amount,
+      deadline: 2_000n,
     })).rejects.toMatchObject({
-      errorName: 'PermitExpired',
-      code: 'DIVIGENT_CONTRACT_REVERT',
+      code: 'DIVIGENT_WRITE_FAILED',
     });
+    expect(simulateContract.mock.calls.map((call) => call[0].functionName)).toEqual([
+      'depositWithPermit',
+    ]);
+    expect(writeContract).not.toHaveBeenCalled();
+  });
+  // Exercises: rejects expired permit-deposit deadlines before signing.
+  it('rejects too-soon permit-deposit deadlines before signing', async () => {
+    const { divigent, signTypedData, simulateContract } = createDivigentWithClients();
+
+    await expect(divigent.depositWithPermit({
+      amount: usdc('0.001'),
+      deadline: 1_000n,
+    })).rejects.toMatchObject({
+      code: 'DIVIGENT_SIGNATURE_DEADLINE_TOO_SOON',
+    });
+    expect(signTypedData).not.toHaveBeenCalled();
+    expect(simulateContract).not.toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'depositWithPermit',
+    }));
   });
   // Exercises: surfaces replayed permit allowance failures from router simulation.
   it('surfaces replayed permit allowance failures from router simulation', async () => {
@@ -701,27 +739,39 @@ describe('depositWithPermit behavior', () => {
       code: 'DIVIGENT_CONTRACT_REVERT',
     });
   });
-  // Exercises: serializes permit signing per owner to avoid nonce collisions.
-  it('serializes permit signing per owner to avoid nonce collisions', async () => {
-    let inFlight = 0;
-    let maxInFlight = 0;
-    const { divigent, signTypedData } = createDivigentWithClients({
-      signTypedData: async () => {
-        inFlight++;
-        maxInFlight = Math.max(maxInFlight, inFlight);
-        await new Promise((resolve) => setTimeout(resolve, 5));
-        inFlight--;
-        return lowSSignature();
+  // Exercises: keeps the permit queue locked until the nonce-consuming tx is mined.
+  it('serializes permit signing per owner until the transaction receipt is observed', async () => {
+    let releaseFirstReceipt!: () => void;
+    let firstReceiptPending = false;
+    const firstReceipt = new Promise<void>((resolve) => {
+      releaseFirstReceipt = resolve;
+    });
+    const { divigent, signTypedData, waitForTransactionReceipt } = createDivigentWithClients({
+      writeHashes: [HASH_1, HASH_2],
+      signTypedData: () => lowSSignature(),
+      waitForTransactionReceipt: async ({ hash }) => {
+        if (hash === HASH_1) {
+          firstReceiptPending = true;
+          await firstReceipt;
+          firstReceiptPending = false;
+        }
+        return { transactionHash: hash, logs: [] };
       },
     });
 
-    await Promise.all([
-      divigent.depositWithPermit({ amount: usdc('0.001'), wallet: OWNER }),
-      divigent.depositWithPermit({ amount: usdc('0.002'), wallet: OWNER }),
-    ]);
+    const first = divigent.depositWithPermit({ amount: usdc('0.001'), wallet: OWNER });
+    await vi.waitFor(() => expect(waitForTransactionReceipt).toHaveBeenCalledTimes(1));
+    expect(firstReceiptPending).toBe(true);
+
+    const second = divigent.depositWithPermit({ amount: usdc('0.002'), wallet: OWNER });
+    await Promise.resolve();
+    expect(signTypedData).toHaveBeenCalledTimes(1);
+
+    releaseFirstReceipt();
+    await Promise.all([first, second]);
 
     expect(signTypedData).toHaveBeenCalledTimes(2);
-    expect(maxInFlight).toBe(1);
+    expect(waitForTransactionReceipt).toHaveBeenCalledTimes(2);
   });
   // Exercises: keeps the permit queue usable after a failed permit attempt.
   it('keeps the permit queue usable after a failed permit attempt', async () => {

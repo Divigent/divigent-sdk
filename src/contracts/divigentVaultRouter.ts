@@ -1,7 +1,9 @@
 import type { Hex, PublicClient, WalletClient } from 'viem';
 import { routerAbi } from '../abis';
 import { vaultTypeFromId } from '../core/vaultTypes';
+import { assertSignatureDeadline } from '../deadlines';
 import { DivigentError, runRead, runSign, runWrite } from '../errors';
+import { sanitizeFeeOverrides } from '../fees';
 import {
   type EvmAddress,
   type FeeOverrides,
@@ -342,9 +344,38 @@ async function simulateAndWrite(
 ): Promise<`0x${string}`> {
   return runWrite(async () => {
     const { request: simulated } = await publicClient.simulateContract(request as never);
-    const final = fees ? { ...simulated, ...fees } : simulated;
+    const sanitizedFees = sanitizeFeeOverrides(fees);
+    const final = sanitizedFees ? { ...simulated, ...sanitizedFees } : simulated;
     return walletClient.writeContract(final as never);
   }, routerAbi);
+}
+
+function normalizeLowSSignature(signature: Hex): Hex {
+  const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+  const HALF_N = SECP256K1_N >> 1n;
+
+  const rHex = signature.slice(2, 66);
+  let sBig = BigInt(`0x${signature.slice(66, 130)}`);
+  let vRaw = parseInt(signature.slice(130, 132), 16);
+  let v = vRaw < 27 ? vRaw + 27 : vRaw;
+
+  if (sBig > HALF_N) {
+    sBig = SECP256K1_N - sBig;
+    v = v === 27 ? 28 : 27;
+  }
+
+  if (v !== 27 && v !== 28) {
+    throw new DivigentError(
+      `[@divigent/sdk] unexpected v=${v} from signTypedData; expected 27 or 28`,
+      {
+        code: 'DIVIGENT_INVALID_SIGNATURE_V',
+        category: 'wallet',
+        context: { v },
+      },
+    );
+  }
+
+  return `0x${rHex}${sBig.toString(16).padStart(64, '0')}${v.toString(16).padStart(2, '0')}` as Hex;
 }
 
 // Wallet registration
@@ -590,6 +621,7 @@ export async function signInitializeFor(params: {
 }): Promise<Hex> {
   const { account, chain } = assertSigner(params.walletClient);
   const { publicClient, router, wallet, deadline } = params;
+  await assertSignatureDeadline(publicClient, deadline, 'InitializeFor');
 
   // Trust contract-declared name/version, but pin chain and verifying contract locally.
   const [domain, nonce] = await Promise.all([
@@ -627,7 +659,7 @@ export async function signInitializeFor(params: {
     );
   }
 
-  return runSign(() => params.walletClient.signTypedData({
+  const signature = await runSign(() => params.walletClient.signTypedData({
     account,
     domain: {
       name,
@@ -645,4 +677,5 @@ export async function signInitializeFor(params: {
     primaryType: 'InitializeFor',
     message: { wallet, deadline, nonce },
   }));
+  return normalizeLowSSignature(signature);
 }

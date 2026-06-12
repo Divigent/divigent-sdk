@@ -140,6 +140,7 @@ describe('capital safety invariants', () => {
         previewWithdrawNet: (deficit) => deficit + 1n,
       });
       attachDivigentYield(client as never, divigent, {
+        allowAllPayTo: true,
         minIdleThreshold: item.floor,
         maxPaymentAmount: needed + 1n,
       });
@@ -167,6 +168,7 @@ describe('capital safety invariants', () => {
       previewWithdrawNet: (deficit) => deficit,
     });
     attachDivigentYield(client as never, divigent, {
+      allowAllPayTo: true,
       maxPaymentAmount: usdc('0.000099'),
       minIdleThreshold: 0n,
     });

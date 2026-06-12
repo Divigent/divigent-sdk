@@ -1,5 +1,7 @@
 import type { Hex, PublicClient, WalletClient } from 'viem';
+import { getAddress } from 'viem';
 import { usdcAbi } from '../abis';
+import { assertSignatureDeadline } from '../deadlines';
 import {
   DivigentError,
   PermitUnsupportedFor7702AccountError,
@@ -15,6 +17,7 @@ import {
   type TxHash,
   txHash,
 } from '../types';
+import { sanitizeFeeOverrides } from '../fees';
 
 // Reads
 
@@ -128,7 +131,8 @@ export async function approveUsdc(params: {
       args: [spender, amount],
       account,
     });
-    const final = fees ? { ...request, ...fees } : request;
+    const sanitizedFees = sanitizeFeeOverrides(fees);
+    const final = sanitizedFees ? { ...request, ...sanitizedFees } : request;
     // viem overloads cannot preserve this simulated request shape through a helper.
     return walletClient.writeContract(final as never);
   }, usdcAbi);
@@ -170,6 +174,18 @@ export async function signUsdcPermit(params: {
     });
   }
   const owner = params.owner ?? (account.address as EvmAddress);
+  const signer = getAddress(account.address) as EvmAddress;
+  if (getAddress(owner) !== signer) {
+    throw new DivigentError(
+      '[@divigent/sdk] USDC permit owner must match walletClient.account.address',
+      {
+        code: 'DIVIGENT_PERMIT_OWNER_MISMATCH',
+        category: 'validation',
+        context: { owner, signer },
+      },
+    );
+  }
+  await assertSignatureDeadline(publicClient, deadline, 'USDC permit');
 
   // Contract-code owners require ERC-1271; this EOA-style permit would fail.
   const ownerCode = await runRead(() => publicClient.getCode({ address: owner }));

@@ -116,6 +116,15 @@ describe('Divigent config and wallet guards', () => {
 
     expect(divigent.chain).toBe('base');
   });
+  // Exercises: refuses to silently fall back to a default chain when clients are unbound.
+  it('requires explicit chain when viem clients do not declare one', () => {
+    const { publicClient, walletClient } = createMockClients({ includeWalletChain: false });
+
+    expect(() => Divigent.create({
+      publicClient: { ...publicClient, chain: undefined } as typeof publicClient,
+      walletClient,
+    })).toThrow(DivigentError);
+  });
   // Exercises: validates custom address overrides before any on-chain call.
   it('validates custom address overrides before any on-chain call', () => {
     const { publicClient, walletClient } = createMockClients();
@@ -434,6 +443,7 @@ describe('transaction planning', () => {
   // Exercises: approval buffering preserves exact values for revokes and max approvals.
   it.each([
     ['zero revokes', 0n],
+    ['max uint256 minus one approvals', (1n << 256n) - 2n],
     ['max uint256 approvals', (1n << 256n) - 1n],
   ])('does not buffer %s', async (_label, approvalAmount) => {
     const { divigent, simulateContract } = createDivigentWithClients({
@@ -476,6 +486,21 @@ describe('transaction planning', () => {
       maxPriorityFeePerGas: 2n,
     });
   });
+  // Exercises: runtime fee override objects cannot replace simulated request identity fields.
+  it('rejects unsupported fee override fields at runtime', async () => {
+    const { divigent, writeContract } = createDivigentWithClients();
+    const maliciousFees = {
+      maxFeePerGas: 10n,
+      address: addresses.router,
+      functionName: 'withdraw',
+    } as never;
+
+    await expect(divigent.planApproveUsdc(usdc('0.001'), maliciousFees))
+      .rejects.toMatchObject({ code: 'DIVIGENT_INVALID_FEE_OVERRIDES' });
+    await expect(divigent.approveUsdc(usdc('0.001'), maliciousFees))
+      .rejects.toMatchObject({ code: 'DIVIGENT_INVALID_FEE_OVERRIDES' });
+    expect(writeContract).not.toHaveBeenCalled();
+  });
   // Exercises: broadcasts a planned transaction request without rebuilding it.
   it('broadcasts a planned transaction request without rebuilding it', async () => {
     const { divigent, writeContract } = createDivigentWithClients({
@@ -507,6 +532,29 @@ describe('transaction planning', () => {
     });
     expect(simulateContract).not.toHaveBeenCalled();
   });
+  // Exercises: deposit planning rejects below-minimum amounts before approval planning.
+  it('validates minimum deposit before returning an approval-required deposit plan', async () => {
+    const { divigent, readContract, simulateContract } = createDivigentWithClients({
+      allowance: 0n,
+      minDeposit: usdc('10'),
+      previewDeposit: 1_000_000n,
+    });
+
+    await expect(divigent.planDeposit({ amount: usdc('1') })).rejects.toMatchObject({
+      code: 'DIVIGENT_MIN_DEPOSIT_NOT_MET',
+      context: {
+        amount: usdc('1'),
+        minDeposit: usdc('10'),
+      },
+    });
+    expect(readContract).not.toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'previewDeposit',
+    }));
+    expect(readContract).not.toHaveBeenCalledWith(expect.objectContaining({
+      functionName: 'allowance',
+    }));
+    expect(simulateContract).not.toHaveBeenCalled();
+  });
   // Exercises: deposit plans check allowance from the wallet that funds the deposit,
   // not from an operator or relayer submitting the transaction.
   it('plans deposit approval requirement from the funding wallet override', async () => {
@@ -514,6 +562,7 @@ describe('transaction planning', () => {
     const { divigent, readContract } = createDivigentWithClients({
       previewDeposit: 1_000_000n,
       readContract: (request) => {
+        if (request.functionName === 'MIN_DEPOSIT') return 0n;
         if (request.functionName === 'previewDeposit') return 1_000_000n;
         if (request.functionName === 'allowance') {
           expect(request.args).toEqual([SECOND_OWNER, addresses.router]);

@@ -323,7 +323,7 @@ export async function sendDepositPlanAndAssert(
 ): Promise<DepositAssertionResult> {
   const hash = await agent.sdk.sendPlan(plan);
   const receipt = await sendAndExpectSuccess(publicClient, hash);
-  const deposit = parseDepositReceipt(receipt);
+  const deposit = parseDepositReceipt(receipt, agent.sdk.addresses.router);
   const event = expectDepositedEvent(receipt, {
     wallet: agent.wallet,
     usdcAmount: plan.amount,
@@ -380,7 +380,7 @@ export async function sendWithdrawPlanAndAssert(
 ): Promise<WithdrawAssertionResult> {
   const hash = await agent.sdk.sendPlan(plan);
   const receipt = await sendAndExpectSuccess(publicClient, hash);
-  const withdraw = parseWithdrawReceipt(receipt);
+  const withdraw = parseWithdrawReceipt(receipt, agent.sdk.addresses.router);
   const event = expectWithdrawnEvent(receipt, {
     wallet: agent.wallet,
     sharesBurned: plan.shares,

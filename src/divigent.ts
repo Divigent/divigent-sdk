@@ -49,6 +49,7 @@ import {
   depositIdleWithReserveFloor,
 } from './x402/handle';
 import type { FeeOverrides } from './types';
+import { sanitizeFeeOverrides } from './fees';
 import type {
   X402AttachHandle,
   X402IdleDepositOptions,
@@ -164,8 +165,8 @@ export type DivigentConfig = {
   walletClient?: WalletClient | undefined;
   /**
    * @notice Supported deployment chain.
-   * @remarks If omitted, the SDK infers from bound viem client chains when possible,
-   * then falls back to `base-sepolia` for backwards compatibility.
+   * @remarks If omitted, the SDK infers from bound viem client chains when possible.
+   * If neither client declares a supported chain, creation fails loudly.
    */
   chain?: DivigentChain | undefined;
   /** @notice Optional custom deployment addresses for private/test deployments. */
@@ -304,7 +305,8 @@ function withFeeOverrides(
   request: unknown,
   fees: FeeOverrides | undefined,
 ): DivigentWriteRequest {
-  return (fees ? { ...(request as object), ...fees } : request) as DivigentWriteRequest;
+  const sanitized = sanitizeFeeOverrides(fees);
+  return (sanitized ? { ...(request as object), ...sanitized } : request) as DivigentWriteRequest;
 }
 
 function sameAddress(a: EvmAddress, b: EvmAddress): boolean {
@@ -315,53 +317,22 @@ function approvalAmountWithDustBuffer(amount: bigint): bigint {
   // Keep SDK-managed approvals deposit-safe even if an RPC or token implementation
   // treats an exact allowance edge inconsistently. One atomic USDC unit is the
   // smallest possible buffer and avoids the unlimited-approval footgun. Preserve
-  // zero for explicit allowance revokes and max uint256 to avoid overflow.
-  if (amount === 0n || amount === MAX_UINT256) return amount;
+  // zero for explicit allowance revokes and values that would become max uint256.
+  if (amount === 0n || amount >= MAX_UINT256 - 1n) return amount;
   return amount + 1n;
 }
 
-function errorText(error: unknown): string {
-  const parts: string[] = [];
-  const seen = new Set<unknown>();
-  let cur: unknown = error;
-  let depth = 0;
-  while (cur && depth < 16 && !seen.has(cur)) {
-    seen.add(cur);
-    if (cur instanceof Error) {
-      parts.push(cur.message);
-      const shortMessage = (cur as { shortMessage?: unknown }).shortMessage;
-      if (typeof shortMessage === 'string') parts.push(shortMessage);
-    } else if (typeof cur === 'string') {
-      parts.push(cur);
-    }
-    cur = (cur as { cause?: unknown }).cause;
-    depth++;
-  }
-  return parts.join('\n').toLowerCase();
-}
-
 function shouldFallbackPermitWriteToApproval(error: unknown): boolean {
-  if (error instanceof DivigentError) {
-    const errorName = error.context?.errorName;
-    if (errorName === 'InsufficientPermitAllowance') return true;
-    const reason = error.context?.reason;
-    if (
-      typeof reason === 'string' &&
-      reason.toLowerCase().includes('transfer amount exceeds allowance')
-    ) {
-      return true;
-    }
+  if (!(error instanceof DivigentError)) {
+    return false;
   }
 
-  const text = errorText(error);
+  const errorName = error.context?.errorName;
+  if (errorName === 'InsufficientPermitAllowance') return true;
+  const reason = error.context?.reason;
   return (
-    text.includes('transfer amount exceeds allowance') ||
-    text.includes('erc20: insufficient allowance') ||
-    text.includes('erc20insufficientallowance') ||
-    text.includes('erc20 insufficient allowance') ||
-    text.includes('insufficient allowance') ||
-    text.includes('insufficientpermitallowance') ||
-    text.includes('insufficient permit allowance')
+    typeof reason === 'string' &&
+    reason.toLowerCase().includes('transfer amount exceeds allowance')
   );
 }
 
@@ -377,11 +348,36 @@ function resolveChain(config: DivigentConfig): DivigentChain {
   const publicChain = publicChainId === undefined ? undefined : chainFromId(publicChainId);
   const walletChain = walletChainId === undefined ? undefined : chainFromId(walletChainId);
 
+  if (publicChainId !== undefined && publicChain === undefined) {
+    throw new DivigentError(`[@divigent/sdk] unsupported publicClient chain id: ${publicChainId}`, {
+      code: 'DIVIGENT_UNSUPPORTED_CHAIN',
+      category: 'config',
+      context: { client: 'publicClient', chainId: publicChainId },
+    });
+  }
+  if (walletChainId !== undefined && walletChain === undefined) {
+    throw new DivigentError(`[@divigent/sdk] unsupported walletClient chain id: ${walletChainId}`, {
+      code: 'DIVIGENT_UNSUPPORTED_CHAIN',
+      category: 'config',
+      context: { client: 'walletClient', chainId: walletChainId },
+    });
+  }
+
   if (publicChain !== undefined && walletChain !== undefined && publicChain !== walletChain) {
     throw new ChainMismatchError(CHAINS[publicChain].id, CHAINS[walletChain].id, 'walletClient');
   }
 
-  return publicChain ?? walletChain ?? 'base-sepolia';
+  const resolved = publicChain ?? walletChain;
+  if (resolved === undefined) {
+    throw new DivigentError(
+      '[@divigent/sdk] unable to infer chain; pass chain or bind publicClient/walletClient to a supported chain',
+      {
+        code: 'DIVIGENT_CHAIN_REQUIRED',
+        category: 'config',
+      },
+    );
+  }
+  return resolved;
 }
 
 /** @notice Main viem-native facade for Divigent reads, writes, signing, and x402 hooks. */
@@ -1083,6 +1079,7 @@ export class Divigent {
     const { account, chain } = this.requireSigner();
     const owner = account.address as EvmAddress;
     const wallet = params.wallet ?? owner;
+    await this.assertMinDepositAmount(params.amount);
     const previewShares = await this.previewDeposit(params.amount);
     const slippageBps = params.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
     const minSharesOut = params.minSharesOut ?? applySlippageDown(previewShares, slippageBps);
@@ -1158,7 +1155,7 @@ export class Divigent {
   async depositAndWait(params: DepositParams & WaitOptions): Promise<DepositResult> {
     const hash = await this.deposit(params);
     const receipt = await this.waitForReceipt(hash, params);
-    return parseDepositReceipt(receipt);
+    return parseDepositReceipt(receipt, this.addresses.router);
   }
 
   /**
@@ -1208,7 +1205,7 @@ export class Divigent {
       }
 
       try {
-        return await depositWithPermitWrite({
+        const hash = await depositWithPermitWrite({
           walletClient: this.requireWallet(),
           publicClient: this.publicClient,
           router: this.addresses.router,
@@ -1218,6 +1215,8 @@ export class Divigent {
           minSharesOut,
           ...(params.fees && { fees: params.fees }),
         });
+        await this.waitForReceipt(hash);
+        return hash;
       } catch (err) {
         if (fallback && shouldFallbackPermitWriteToApproval(err)) {
           return this.depositViaApproval(params, wallet, minSharesOut);
@@ -1235,7 +1234,7 @@ export class Divigent {
   async depositWithPermitAndWait(params: DepositWithPermitParams & WaitOptions): Promise<DepositResult> {
     const hash = await this.depositWithPermit(params);
     const receipt = await this.waitForReceipt(hash, params);
-    return parseDepositReceipt(receipt);
+    return parseDepositReceipt(receipt, this.addresses.router);
   }
 
   /**
@@ -1322,7 +1321,7 @@ export class Divigent {
   async withdrawAndWait(params: WithdrawParams & WaitOptions): Promise<WithdrawResult> {
     const hash = await this.withdraw(params);
     const receipt = await this.waitForReceipt(hash, params);
-    return parseWithdrawReceipt(receipt);
+    return parseWithdrawReceipt(receipt, this.addresses.router);
   }
 
   // Governance writes

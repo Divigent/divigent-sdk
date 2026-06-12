@@ -55,6 +55,8 @@ describe('core utils', () => {
 
     expect(applyBps(amount, 0)).toBe(0n);
     expect(applyBps(amount, 10_000)).toBe(amount);
+    expect(() => applyBps(amount, -1)).toThrow(DivigentError);
+    expect(() => applyBps(amount, 10_001)).toThrow(DivigentError);
     expect(applySlippageDown(amount, 0)).toBe(amount);
     expect(applySlippageDown(amount, 10_000)).toBe(0n);
   });
@@ -76,6 +78,7 @@ describe('core utils', () => {
   it('calculates fee and rejects invalid fee bps', () => {
     expect(applyFee(1_000_000n)).toBe(100_000n);
     expect(applyFee(1_000_000n, 250n)).toBe(25_000n);
+    expect(applyFee(1n, 1000n)).toBe(1n);
     expect(() => applyFee(1_000_000n, -1n)).toThrow(DivigentError);
     expect(() => applyFee(1_000_000n, 10_001n)).toThrow(DivigentError);
   });
@@ -88,11 +91,12 @@ describe('core utils', () => {
   // Exercises: matches the router virtual-offset share math.
   it('matches the router virtual-offset share math', () => {
     expect(convertToShares(1_000n, 10_000n, 20_000n)).toBe(
-      (1_000n * 10_001n) / 20_001n,
+      (1_000n * 1_010_000n) / 1_020_000n,
     );
     expect(convertToAssets(500n, 10_000n, 20_000n)).toBe(
-      (500n * 20_001n) / 10_001n,
+      (500n * 1_020_000n) / 1_010_000n,
     );
+    expect(convertToAssets(20_000n, 1n, 100n)).toBe(100n);
   });
   // Exercises: formats display strings with trimming and truncation.
   it('formats display strings with trimming and truncation', () => {

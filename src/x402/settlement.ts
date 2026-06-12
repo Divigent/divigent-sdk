@@ -96,7 +96,6 @@ async function settlementDebitReserve(
     }
 
     const allowedPayTo = new Set((options.config?.allowedPayTo ?? []).map((addr) => addr.toLowerCase()));
-    if (allowedPayTo.size === 0) return responseReserve;
     const transfers = parseEventLogs({
       abi: usdcAbi,
       logs: receipt.logs as Parameters<typeof parseEventLogs>[0]['logs'],
@@ -135,6 +134,8 @@ export type DepositIdleOptions = {
   wallet?: EvmAddress;
   /** @notice Skip the deposit if the idle amount is below this threshold. Default: 1n. */
   minDeposit?: bigint | (() => bigint | Promise<bigint>);
+  /** @notice Slippage guard for the automated deposit back into Divigent. */
+  depositSlippageBps?: number;
   /** @notice Idempotency key for settlement/income sweeps. */
   dedupeKey?: string;
   /** @notice Optional set used to remember settled transaction keys. */
@@ -182,6 +183,7 @@ export async function depositIdleAboveFloor(
       amount: idle,
       wallet,
       fallbackOnPermitUnsupported: true,
+      ...(options.depositSlippageBps !== undefined && { slippageBps: options.depositSlippageBps }),
     });
     const txHash = result.txHash;
     if (options.dedupeKey) options.seenTxHashes?.add(options.dedupeKey);
@@ -218,6 +220,8 @@ export type HandleSettlementOptions = {
   resource?: string;
   /** @notice Skip deposits below this idle amount. Default: 1n. */
   minDeposit?: DepositIdleOptions['minDeposit'];
+  /** @notice Override x402 config slippage for this automated deposit. */
+  depositSlippageBps?: number;
   /** @notice Receives successful idle-deposit telemetry. */
   onIdleDeposit?: DepositIdleOptions['onIdleDeposit'];
   /** @notice Receives non-fatal idle-deposit observer errors. */
@@ -257,6 +261,8 @@ export async function handleDivigentSettlement(
   const opts: DepositIdleOptions = { dedupeKey: settlementDedupeKey(divigent, settle.transaction) };
   if (options.seenTxHashes !== undefined) opts.seenTxHashes = options.seenTxHashes;
   if (options.minDeposit !== undefined) opts.minDeposit = options.minDeposit;
+  const depositSlippageBps = options.depositSlippageBps ?? options.config?.depositSlippageBps;
+  if (depositSlippageBps !== undefined) opts.depositSlippageBps = depositSlippageBps;
   if (options.onIdleDeposit !== undefined) opts.onIdleDeposit = options.onIdleDeposit;
   if (options.onNonFatalError !== undefined) opts.onNonFatalError = options.onNonFatalError;
   let settlementReserve = 0n;
@@ -286,6 +292,8 @@ export type WrapFetchOptions = {
   config?: X402WrapConfig;
   /** @notice Skip deposits below this idle amount. Default: 1n. */
   minDeposit?: DepositIdleOptions['minDeposit'];
+  /** @notice Override x402 config slippage for automated deposits. */
+  depositSlippageBps?: number;
   /** @notice Wait for the idle deposit before returning the paid response. */
   waitForIdleDeposit?: boolean;
   /** @notice Receives successful idle-deposit telemetry. */
@@ -327,6 +335,9 @@ export function wrapFetchWithDivigentYield(
     if (options.config !== undefined) settlementOptions.config = options.config;
     if (resource !== undefined) settlementOptions.resource = resource;
     if (options.minDeposit !== undefined) settlementOptions.minDeposit = options.minDeposit;
+    if (options.depositSlippageBps !== undefined) {
+      settlementOptions.depositSlippageBps = options.depositSlippageBps;
+    }
     if (options.onIdleDeposit !== undefined) settlementOptions.onIdleDeposit = options.onIdleDeposit;
     settlementOptions.onNonFatalError = options.onNonFatalError ?? options.config?.onNonFatalError;
     const settlement = handleDivigentSettlement(res.clone(), http, divigent, reserveFloor, settlementOptions)
@@ -354,6 +365,8 @@ export type AttachIncomeOptions = {
   dedupeCapacity?: number;
   /** @notice Skip deposits below this idle amount. Default: 1n. */
   minDeposit?: DepositIdleOptions['minDeposit'];
+  /** @notice Slippage guard for seller income deposits back into Divigent. */
+  depositSlippageBps?: number;
   /** @notice Receives successful income-deposit telemetry. */
   onIdleDeposit?: DepositIdleOptions['onIdleDeposit'];
   /** @notice Receives non-fatal income redeposit errors. Exceptions are swallowed. */
@@ -389,6 +402,7 @@ export function attachDivigentIncome(
     };
     if (options.wallet !== undefined) opts.wallet = options.wallet;
     if (options.minDeposit !== undefined) opts.minDeposit = options.minDeposit;
+    if (options.depositSlippageBps !== undefined) opts.depositSlippageBps = options.depositSlippageBps;
     if (options.onIdleDeposit !== undefined) opts.onIdleDeposit = options.onIdleDeposit;
     if (options.onNonFatalError !== undefined) opts.onNonFatalError = options.onNonFatalError;
     try {

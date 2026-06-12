@@ -73,9 +73,17 @@ export function bigintAbs(a: bigint): bigint {
  * @param amount Base amount.
  * @param bps Basis-points rate.
  * @returns `amount * bps / 10_000`.
+ * @throws If `bps` is outside 0..10_000.
  */
 export function applyBps(amount: bigint, bps: number | bigint): bigint {
   const bpsBI = typeof bps === 'bigint' ? bps : BigInt(bps);
+  if (bpsBI < 0n || bpsBI > BPS_DENOMINATOR) {
+    throw new DivigentError(`[@divigent/sdk] invalid bps: ${bpsBI}`, {
+      code: 'DIVIGENT_INVALID_BPS',
+      category: 'validation',
+      context: { bps: bpsBI },
+    });
+  }
   return (amount * bpsBI) / BPS_DENOMINATOR;
 }
 
@@ -116,7 +124,9 @@ export function applyFee(yieldEarned: bigint, feeBps: bigint = DIVIGENT_FEE_BPS)
       context: { feeBps },
     });
   }
-  return (yieldEarned * feeBps) / BPS_DENOMINATOR;
+  const product = yieldEarned * feeBps;
+  if (product === 0n) return 0n;
+  return (product + BPS_DENOMINATOR - 1n) / BPS_DENOMINATOR;
 }
 
 // Decimal rescaling
@@ -150,6 +160,8 @@ export function rescaleDecimals(
 
 // ERC-4626 virtual-offset share math
 
+const ROUTER_VIRTUAL_OFFSET = 1_000_000n;
+
 /**
  * @notice Preview shares minted for an asset amount using the router's virtual-offset math.
  * @param assets Asset amount.
@@ -162,7 +174,8 @@ export function convertToShares(
   totalSupply: bigint,
   totalAssets: bigint,
 ): bigint {
-  return (assets * (totalSupply + 1n)) / (totalAssets + 1n);
+  return (assets * (totalSupply + ROUTER_VIRTUAL_OFFSET)) /
+    (totalAssets + ROUTER_VIRTUAL_OFFSET);
 }
 
 /**
@@ -177,7 +190,9 @@ export function convertToAssets(
   totalSupply: bigint,
   totalAssets: bigint,
 ): bigint {
-  return (shares * (totalAssets + 1n)) / (totalSupply + 1n);
+  const assets = (shares * (totalAssets + ROUTER_VIRTUAL_OFFSET)) /
+    (totalSupply + ROUTER_VIRTUAL_OFFSET);
+  return assets > totalAssets ? totalAssets : assets;
 }
 
 // Display formatter

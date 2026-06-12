@@ -24,7 +24,7 @@ import {
   runWrite,
   toDivigentError,
 } from '../../src/errors';
-import { HASH_1, OWNER, usdc } from './helpers';
+import { HASH_1, OWNER, addresses, usdc } from './helpers';
 
 type AbiError = {
   type: 'error';
@@ -51,6 +51,7 @@ function sampleArg(type: string): unknown {
 function receiptWithLog(log: {
   topics: readonly `0x${string}`[];
   data: `0x${string}`;
+  address?: `0x${string}`;
 }): TransactionReceipt {
   return receiptWithLogs([log]);
 }
@@ -58,12 +59,13 @@ function receiptWithLog(log: {
 function receiptWithLogs(logs: Array<{
   topics: readonly `0x${string}`[];
   data: `0x${string}`;
+  address?: `0x${string}`;
 }>): TransactionReceipt {
   return {
     transactionHash: HASH_1,
     logs: logs.map((log, index) => ({
       ...log,
-      address: `0x100000000000000000000000000000000000000${index + 1}`,
+      address: log.address ?? addresses.router,
     })),
   } as unknown as TransactionReceipt;
 }
@@ -81,7 +83,10 @@ describe('receipt parsing', () => {
       [usdc('0.001'), 990n],
     );
 
-    expect(parseDepositReceipt(receiptWithLog({ topics: topics as `0x${string}`[], data }))).toEqual({
+    expect(parseDepositReceipt(
+      receiptWithLog({ topics: topics as `0x${string}`[], data }),
+      addresses.router,
+    )).toEqual({
       txHash: HASH_1,
       sharesMinted: 990n,
     });
@@ -98,7 +103,10 @@ describe('receipt parsing', () => {
       [500n, usdc('0.000490'), usdc('0.000010'), usdc('0.000001')],
     );
 
-    expect(parseWithdrawReceipt(receiptWithLog({ topics: topics as `0x${string}`[], data }))).toEqual({
+    expect(parseWithdrawReceipt(
+      receiptWithLog({ topics: topics as `0x${string}`[], data }),
+      addresses.router,
+    )).toEqual({
       txHash: HASH_1,
       usdcReturned: usdc('0.000490'),
     });
@@ -127,7 +135,35 @@ describe('receipt parsing', () => {
     expect(parseDepositReceipt(receiptWithLogs([
       { topics: withdrawTopics as `0x${string}`[], data: withdrawData },
       { topics: depositTopics as `0x${string}`[], data: depositData },
-    ]))).toEqual({
+    ]), addresses.router)).toEqual({
+      txHash: HASH_1,
+      sharesMinted: 990n,
+    });
+  });
+  // Exercises: ignores foreign contracts emitting the same router event signature.
+  it('filters money events by router emitter', () => {
+    const topics = encodeEventTopics({
+      abi: routerAbi,
+      eventName: 'Deposited',
+      args: { wallet: OWNER, vaultType: 1 },
+    });
+    const foreignData = encodeAbiParameters(
+      [{ type: 'uint256' }, { type: 'uint256' }],
+      [usdc('10'), 123n],
+    );
+    const routerData = encodeAbiParameters(
+      [{ type: 'uint256' }, { type: 'uint256' }],
+      [usdc('0.001'), 990n],
+    );
+
+    expect(parseDepositReceipt(receiptWithLogs([
+      {
+        address: '0x2222222222222222222222222222222222222222',
+        topics: topics as `0x${string}`[],
+        data: foreignData,
+      },
+      { topics: topics as `0x${string}`[], data: routerData },
+    ]), addresses.router)).toEqual({
       txHash: HASH_1,
       sharesMinted: 990n,
     });
@@ -135,8 +171,8 @@ describe('receipt parsing', () => {
   // Exercises: throws typed receipt errors when expected events are missing.
   it('throws typed receipt errors when expected events are missing', () => {
     const empty = { transactionHash: HASH_1, logs: [] } as unknown as TransactionReceipt;
-    expect(() => parseDepositReceipt(empty)).toThrow(ReceiptParseError);
-    expect(() => parseWithdrawReceipt(empty)).toThrow(ReceiptParseError);
+    expect(() => parseDepositReceipt(empty, addresses.router)).toThrow(ReceiptParseError);
+    expect(() => parseWithdrawReceipt(empty, addresses.router)).toThrow(ReceiptParseError);
   });
 });
 

@@ -115,6 +115,8 @@ export type X402WrapConfig = {
   reserveMultiplier?: number;
   /** @notice Slippage guard for vault withdrawals used by the x402 recall path. */
   slippageBps?: number;
+  /** @notice Slippage guard for automated x402 deposits back into Divigent. */
+  depositSlippageBps?: number;
   /** @notice Hard cap on per-payment amount the hook will act on. */
   maxPaymentAmount?: bigint;
   /** @notice Optional cumulative cap for this attached client session. */
@@ -123,6 +125,11 @@ export type X402WrapConfig = {
   requireAllowedPayTo?: boolean;
   /** @notice Optional payee allowlist for Divigent's recall hook. */
   allowedPayTo?: readonly string[];
+  /**
+   * @notice Explicitly allow recalls for any x402 payee when no payee
+   * allowlist is configured. Defaults to false.
+   */
+  allowAllPayTo?: boolean;
   /** @notice Optional URL origin allowlist, e.g. ["https://api.example.com"]. */
   allowedOrigins?: readonly string[];
   /** @deprecated Use `allowedOrigins`. Kept for backwards compatibility. */
@@ -158,6 +165,8 @@ export type X402AutoDepositOptions = {
    * router's on-chain `MIN_DEPOSIT` to avoid dust deposit reverts.
    */
   minDeposit?: bigint | (() => bigint | Promise<bigint>);
+  /** @notice Slippage guard for this automated deposit back into Divigent. */
+  depositSlippageBps?: number;
   /** @notice Wait for the idle deposit before returning the paid response. */
   waitForIdleDeposit?: boolean;
   /** @notice Fires after wallet USDC above the reserve floor is deposited. */
@@ -185,6 +194,8 @@ export type X402IdleDepositOptions = {
    * `MIN_DEPOSIT` in public SDK helpers.
    */
   minDeposit?: bigint | (() => bigint | Promise<bigint>);
+  /** @notice Slippage guard for this automated deposit back into Divigent. */
+  depositSlippageBps?: number;
   /** @notice Fires after wallet USDC above the reserve floor is deposited. */
   onIdleDeposit?: (ctx: IdleDepositContext) => void | Promise<void>;
   /** @notice Receives non-fatal idle-deposit observer errors. */
@@ -208,6 +219,8 @@ export type X402IncomeConfig = {
    * `MIN_DEPOSIT` in public SDK helpers.
    */
   minDeposit?: bigint | (() => bigint | Promise<bigint>);
+  /** @notice Slippage guard for seller income deposits back into Divigent. */
+  depositSlippageBps?: number;
   /** @notice Fires after received x402 income is deposited. */
   onIdleDeposit?: (ctx: IdleDepositContext) => void | Promise<void>;
   /** @notice Receives non-fatal income-deposit errors. */

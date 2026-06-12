@@ -32,13 +32,14 @@
     "test:fork:base": "vitest run test/fork --testTimeout=180000 --maxWorkers=1 --pool=forks",
     "test:integration:base": "vitest run test/integration --testTimeout=180000 --no-file-parallelism --maxWorkers=1 --pool=forks",
     "test:x402:local": "node scripts/run-x402-local-tests.mjs",
+    "audit": "npm audit --audit-level=moderate",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist coverage .turbo",
-    "prepublishOnly": "npm run clean && npm run typecheck && npm run build"
+    "prepublishOnly": "npm run clean && npm run typecheck && npm test && npm run audit && npm run build"
   },
   "peerDependencies": {
     "@x402/core": "^2.0.0",
-    "viem": "^2.21.0"
+    "viem": ">=2.50.4 <3"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
@@ -52,7 +53,7 @@
     "tsup": "^8.3.0",
     "tsx": "^4.21.0",
     "typescript": "^5.5.0",
-    "viem": "^2.21.0",
+    "viem": "^2.50.4",
     "vitest": "^4.1.5"
   },
   "engines": {

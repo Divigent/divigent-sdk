@@ -26,7 +26,13 @@ function reserveFloor(config: ReserveFloorConfig): ReserveFloor {
 function createProtocolMinDeposit(divigent: Divigent): () => Promise<bigint> {
   let minDepositPromise: Promise<bigint> | undefined;
   return () => {
-    minDepositPromise ??= divigent.minDeposit();
+    if (minDepositPromise === undefined) {
+      const pending = divigent.minDeposit();
+      minDepositPromise = pending;
+      void pending.catch(() => {
+        if (minDepositPromise === pending) minDepositPromise = undefined;
+      });
+    }
     return minDepositPromise;
   };
 }
@@ -34,10 +40,12 @@ function createProtocolMinDeposit(divigent: Divigent): () => Promise<bigint> {
 function withProtocolMinDeposit<T extends {
   minDeposit?: X402AutoDepositOptions['minDeposit'];
   onNonFatalError?: X402WrapConfig['onNonFatalError'];
+  depositSlippageBps?: number;
 }>(
   minDeposit: () => Promise<bigint>,
   options: T,
   fallbackOnNonFatalError?: X402WrapConfig['onNonFatalError'],
+  fallbackDepositSlippageBps?: number,
 ): T & { minDeposit: NonNullable<X402AutoDepositOptions['minDeposit']> } {
   const next: T & { minDeposit: NonNullable<X402AutoDepositOptions['minDeposit']> } = {
     ...options,
@@ -45,6 +53,8 @@ function withProtocolMinDeposit<T extends {
   };
   const onNonFatalError = options.onNonFatalError ?? fallbackOnNonFatalError;
   if (onNonFatalError !== undefined) next.onNonFatalError = onNonFatalError;
+  const depositSlippageBps = options.depositSlippageBps ?? fallbackDepositSlippageBps;
+  if (depositSlippageBps !== undefined) next.depositSlippageBps = depositSlippageBps;
   return next;
 }
 
@@ -68,12 +78,26 @@ export function createX402AttachHandle(
     detach: hookHandle.detach,
     wrapFetchWithYield: (fetchWithPayment, http, options = {}) => (
       wrapFetchWithDivigentYield(fetchWithPayment, http, divigent, floor, {
-        ...withProtocolMinDeposit(minDeposit, options, config.onNonFatalError),
+        ...withProtocolMinDeposit(
+          minDeposit,
+          options,
+          config.onNonFatalError,
+          config.depositSlippageBps,
+        ),
         config,
       })
     ),
     depositIdle: (options = {}) => (
-      depositIdleAboveFloor(divigent, floor, withProtocolMinDeposit(minDeposit, options, config.onNonFatalError))
+      depositIdleAboveFloor(
+        divigent,
+        floor,
+        withProtocolMinDeposit(
+          minDeposit,
+          options,
+          config.onNonFatalError,
+          config.depositSlippageBps,
+        ),
+      )
     ),
   };
 }
